@@ -120,6 +120,20 @@ def enrich_item_gst(item: Dict[str, Any], is_intra_state: bool = True) -> Dict[s
     )
 
     if has_printed_components:
+        # ── Rounding consistency fix for CGST/SGST ────────────────────
+        # Invoice printers sometimes show CGST=310.63, SGST=310.62 due to
+        # rounding each component independently. Fix: make them equal.
+        if cgst_amt_existing is not None and sgst_amt_existing is not None:
+            # Both printed — check if they differ by only 0.01
+            diff = abs(cgst_amt_existing - sgst_amt_existing)
+            if 0 < diff <= 0.02:  # Allow up to 2 paisa difference
+                # Make them equal by using the average
+                avg = round_to_2((cgst_amt_existing + sgst_amt_existing) / 2)
+                item['cgst_amount'] = avg
+                item['sgst_amount'] = avg
+                cgst_amt_existing = avg
+                sgst_amt_existing = avg
+        
         # Fill GST_AMT if missing
         if _to_float(item.get('GST_AMT')) is None:
             item['GST_AMT'] = round_to_2(

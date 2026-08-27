@@ -475,44 +475,39 @@ def extract_invoice():
         # Business rule: total_quantity = sum of PAID quantities only.
         # Free items (free_item_yn == "1") are excluded.
         log_step("Calculating total_quantity (paid items only)...")
-            
-            paid_quantity_sum = 0
-            free_quantity_sum = 0
-            
-            for item in extracted_data.get('items', []):
-                qty = item.get('quantity', 0)
-                
-                # Convert to number
-                if isinstance(qty, str):
-                    # Should NOT have "+" at this point!
-                    if '+' in qty:
-                        log_step(f"⚠️  ERROR: Item still has '+' in quantity after splitting: {qty}")
-                        continue
-                    try:
-                        qty = float(qty)
-                    except (ValueError, TypeError):
-                        log_step(f"⚠️  Cannot convert quantity to number: {qty}")
-                        continue
-                elif not isinstance(qty, (int, float)):
-                    continue
-                
-                # Track paid vs free separately
-                if item.get('free_item_yn') == "1":
-                    free_quantity_sum += qty
-                else:
-                    paid_quantity_sum += qty
-            
-            # total_quantity = paid quantities only (free items excluded)
-            extracted_data['total_quantity'] = int(paid_quantity_sum) if paid_quantity_sum == int(paid_quantity_sum) else paid_quantity_sum
-            
-            log_step(f"✅ total_quantity = {extracted_data['total_quantity']} (paid only)")
-            log_step(f"   Paid items total: {paid_quantity_sum}")
-            log_step(f"   Free items total: {free_quantity_sum} (excluded)")
         
-        except Exception as free_item_error:
-            import traceback
-            log_step(f"⚠️  Free item splitting error: {str(free_item_error)}")
-            traceback.print_exc()
+        paid_quantity_sum = 0
+        free_quantity_sum = 0
+        
+        for item in extracted_data.get('items', []):
+            qty = item.get('quantity', 0)
+            
+            # Convert to number
+            if isinstance(qty, str):
+                # Should NOT have "+" at this point!
+                if '+' in qty:
+                    log_step(f"⚠️  ERROR: Item still has '+' in quantity after splitting: {qty}")
+                    continue
+                try:
+                    qty = float(qty)
+                except (ValueError, TypeError):
+                    log_step(f"⚠️  Cannot convert quantity to number: {qty}")
+                    continue
+            elif not isinstance(qty, (int, float)):
+                continue
+            
+            # Track paid vs free separately
+            if item.get('free_item_yn') == "1":
+                free_quantity_sum += qty
+            else:
+                paid_quantity_sum += qty
+        
+        # total_quantity = paid quantities only (free items excluded)
+        extracted_data['total_quantity'] = int(paid_quantity_sum) if paid_quantity_sum == int(paid_quantity_sum) else paid_quantity_sum
+        
+        log_step(f"✅ total_quantity = {extracted_data['total_quantity']} (paid only)")
+        log_step(f"   Paid items total: {paid_quantity_sum}")
+        log_step(f"   Free items total: {free_quantity_sum} (excluded)")
         
         # ═══════════════════════════════════════════════════════════
         # GST VALIDATION (Original)
@@ -930,12 +925,16 @@ def extract_invoice():
             metadata['duplicates_skipped'] = raw_response.get('duplicates_skipped', 0)
         
         # Prepare response
+        # Remove internal metadata fields from data before returning
+        verification_result = extracted_data.pop('_verification', None)
+        reconciliation_result = extracted_data.pop('_reconciliation', None)
+        
         response_data = {
             'success': True,
             'data': extracted_data,
             'metadata': metadata,
             'reasoning': reasoning_log,
-            'reconciliation': extracted_data.pop('_reconciliation', None),
+            'reconciliation': reconciliation_result,
         }
         
         # Cache result if enabled
