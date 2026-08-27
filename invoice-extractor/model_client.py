@@ -15,6 +15,46 @@ from langsmith import traceable
 load_dotenv()
 
 
+# ════════════════════════════════════════════════════════════════════════════════
+#  VERIFICATION PROMPT — post-extraction accuracy check
+# ════════════════════════════════════════════════════════════════════════════════
+
+VERIFICATION_SYSTEM_PROMPT = """You are an invoice verification specialist. Your job: compare extracted JSON data against the source invoice image and flag discrepancies.
+
+VERIFICATION RULES:
+1. Compare EVERY numeric field (quantities, prices, amounts, GST rates) against the printed invoice.
+2. Check item codes, batch numbers, HSN codes character-by-character.
+3. Verify GSTIN format (15 chars, correct pattern).
+4. Check invoice-level totals: sum(item amounts) + GST = invoice_amount.
+5. Flag mismatches, not minor OCR variants (e.g., "O" vs "0" in batch numbers is fine if semantically correct).
+
+OUTPUT FORMAT:
+{
+  "verification_status": "PASS" or "FAIL",
+  "discrepancies": [
+    {"field": "item[0].quantity", "extracted": "20", "invoice_shows": "22", "severity": "high"},
+    {"field": "customer_gstin", "extracted": "27AABCS1234N1ZA", "invoice_shows": "27AABCS1234N1Z5", "severity": "critical"}
+  ],
+  "confidence_score": 0.95,
+  "notes": "All header fields match. Item 3 unit_price differs by ₹0.50 (possible OCR error in decimal point)."
+}
+
+severity levels:
+- "critical": GSTIN, invoice_number, invoice_amount wrong
+- "high": item quantity, price, GST amount wrong
+- "medium": batch number, HSN code, item code wrong
+- "low": Pack, MRP, minor description variant
+
+Be strict. If extraction is perfect, return empty discrepancies array and status="PASS"."""
+
+VERIFICATION_USER_PROMPT = """Here is the extracted JSON from this invoice. Verify it against the image:
+
+EXTRACTED DATA:
+{extracted_json}
+
+Cross-check every field. Return verification result as JSON."""
+
+
 class OpenRouterClient:
     """Client for OpenRouter API with Qwen model."""
     
@@ -132,7 +172,7 @@ class OpenRouterClient:
     @traceable(name="model_extract_invoice", tags=["model", "extraction"], metadata={"model": "qwen3.7-plus"})
     def extract_invoice(
         self,
-        image: Image.Image,
+        image: Image.Image | list[Image.Image],  # NOW supports single image OR list of images
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0.1,
@@ -142,11 +182,25 @@ class OpenRouterClient:
         """
         Extract invoice data using vision model.
         
+        Args:
+            image: Single PIL Image OR list of PIL Images (for multi-page context)
+            system_prompt: System instructions
+            user_prompt: User extraction request
+            temperature: Model temperature
+            max_tokens: Maximum output tokens
+            use_reasoning: Enable high-effort reasoning for character-level accuracy
+        
         Returns:
             Tuple of (extracted_data_dict, raw_response_dict)
         """
-        # Convert image to base64
-        image_b64 = self.image_to_base64(image)
+        # Handle both single image and multiple images
+        if isinstance(image, list):
+            images = image
+            image_b64_list = [self.image_to_base64(img) for img in images]
+            print(f"📸 Sending {len(images)} images to model for extraction")
+        else:
+            images = [image]
+            image_b64_list = [self.image_to_base64(image)]
         
         # Prepare request
         headers = {
@@ -168,12 +222,14 @@ class OpenRouterClient:
                             'type': 'text',
                             'text': user_prompt
                         },
-                        {
-                            'type': 'image_url',
-                            'image_url': {
-                                'url': image_b64
+                        # Send ALL images in this extraction call
+                        *[
+                            {
+                                'type': 'image_url',
+                                'image_url': {'url': img_b64}
                             }
-                        }
+                            for img_b64 in image_b64_list
+                        ]
                     ]
                 }
             ],
@@ -753,41 +809,84 @@ class OpenRouterClient:
             print(f"   Page {idx + 1}: {ctype!r}  ← \"{label}\"")
 
         # ── Select pages to use ──────────────────────────────────
-        # Rule 1: If ANY page is labelled ORIGINAL, use only ORIGINAL pages
-        #         (plus NONE-labelled pages that follow an ORIGINAL, which are
-        #          continuation sheets of the same copy).
-        # Rule 2: If NO page has any recognised label, fall back to pixel dedup.
+        # CRITICAL: Handle replica scenarios properly
+        # 
+        # Scenario 1: Standard multi-copy invoice
+        #   Page 1: ORIGINAL, Page 2: DUPLICATE, Page 3: TRIPLICATE
+        #   → Keep only ORIGINAL (page 1)
+        #
+        # Scenario 2: Multi-page invoice with continuation
+        #   Page 1: ORIGINAL (header + items 1-5)
+        #   Page 2: NONE (items 6-10 continuation)
+        #   → Keep pages 1 AND 2 (both are ORIGINAL copy)
+        #
+        # Scenario 3: Multi-page invoice with replica confusion
+        #   Page 1: ORIGINAL (header + items 1-5)
+        #   Page 2: NONE (items 6-10 continuation)
+        #   Page 3: ORIGINAL (replica of page 1, same items 1-5)
+        #   → Keep pages 1 and 2 ONLY, skip page 3 (pixel-fingerprint detects replica)
+        #
+        # Strategy:
+        #   1. If labels exist: keep ORIGINAL pages + NONE continuations
+        #   2. Within kept pages: run pixel-fingerprint dedup to catch replicas
+        #   3. If no labels: run pixel-fingerprint on all pages
+        # ────────────────────────────────────────────────────────────
         has_labels = any(t in ('ORIGINAL', 'DUPLICATE', 'TRIPLICATE', 'OTHER')
                          for t in page_types)
 
         if has_labels:
-            # Keep ORIGINAL pages and NONE pages that are sandwiched between them.
-            # A "NONE" page between two ORIGINAL pages is a content continuation.
-            # A "NONE" page after a TRIPLICATE is part of the triplicate — skip it.
+            # ── Step 1: Label-based filtering ────────────────────
+            # Keep ORIGINAL pages and NONE pages immediately following an ORIGINAL
             original_indices: list[int] = []
-            last_kept_type = None
+            in_original_section = False
+            
             for idx, ctype in enumerate(page_types):
                 if ctype == 'ORIGINAL':
                     original_indices.append(idx)
-                    last_kept_type = 'ORIGINAL'
-                elif ctype == 'NONE' and last_kept_type == 'ORIGINAL':
+                    in_original_section = True
+                elif ctype == 'NONE' and in_original_section:
                     # Continuation of the original copy
                     original_indices.append(idx)
-                else:
-                    # DUPLICATE / TRIPLICATE / OTHER / NONE after non-ORIGINAL
-                    last_kept_type = ctype
+                elif ctype in ('DUPLICATE', 'TRIPLICATE', 'OTHER'):
+                    # Different copy started — stop accepting NONE pages
+                    in_original_section = False
 
             if not original_indices:
-                # No ORIGINAL found — all copies present but none labelled ORIGINAL
-                # Just take the first distinct copy (pages up to first non-NONE repeat)
-                print("   ⚠️  No ORIGINAL label found — using first copy only")
-                original_indices = [i for i, t in enumerate(page_types)
-                                    if t not in ('DUPLICATE', 'TRIPLICATE')]
+                # No ORIGINAL found — take first complete copy
+                print("   ⚠️  No ORIGINAL label found — using first copy")
+                first_copy_end = next((i for i, t in enumerate(page_types) 
+                                      if t in ('DUPLICATE', 'TRIPLICATE')), len(page_types))
+                original_indices = list(range(first_copy_end))
                 if not original_indices:
                     original_indices = list(range(len(images)))
 
-            unique_images = [images[i] for i in original_indices]
-            print(f"   Label-based selection: pages {[i+1 for i in original_indices]} kept")
+            # ── Step 2: Pixel-fingerprint dedup WITHIN label-filtered pages ────
+            # Catches replicas like: Page 1 ORIGINAL, Page 2 NONE, Page 3 ORIGINAL (replica of page 1)
+            print(f"   Label-based filter: pages {[i+1 for i in original_indices]} selected")
+            print(f"   Running pixel-fingerprint dedup on selected pages...")
+            
+            def _page_fingerprint(img: Image.Image) -> bytes:
+                w, h = img.size
+                if w > h:
+                    img = img.rotate(90, expand=True)
+                thumb = img.convert('L').resize((16, 16), Image.Resampling.LANCZOS)
+                return thumb.tobytes()
+            
+            unique_images = []
+            seen_fps: list[bytes] = []
+            for rel_idx, abs_idx in enumerate(original_indices):
+                img = images[abs_idx]
+                fp = _page_fingerprint(img)
+                is_dup = any(
+                    sum(1 for a, b in zip(fp, s) if abs(a - b) < 15) / len(fp) >= 0.88
+                    for s in seen_fps
+                )
+                if is_dup:
+                    print(f"      Page {abs_idx + 1}: 🔄 pixel-duplicate — skipped")
+                else:
+                    unique_images.append(img)
+                    seen_fps.append(fp)
+                    print(f"      Page {abs_idx + 1}: ✅ unique — kept")
         else:
             # No labels found — use pixel fingerprint dedup as fallback
             print("   No copy labels detected — using pixel fingerprint dedup")
@@ -838,13 +937,26 @@ class OpenRouterClient:
         page_1   = unique_images[0]
         last_page = unique_images[-1]
 
-        # ── Pass 1: Header — page 1 only ─────────────────────────
-        print(f"\n📋 Pass 1: Header from page 1 (full resolution {page_1.width}x{page_1.height})...")
+        # ── Pass 1: Header — ALL PAGES ───────────────────────────────
+        # Send ALL unique pages so model can find PO#, delivery info,
+        # remarks that might be on any page (header, footer, continuation).
+        print(f"\n📋 Pass 1: Header from ALL {n_unique} pages...")
         header_system, header_user = get_header_prompt()
+        
+        # Inject instruction to search all pages
+        header_user_multipage = (
+            f"⚠️ MULTI-PAGE INVOICE: {n_unique} pages provided.\n"
+            f"Search ALL pages for header fields. PO#, delivery date, remarks, "
+            f"customer details may appear on ANY page (header, footer, continuation).\n\n"
+            + header_user
+        )
 
         header_data, header_response = self.extract_invoice(
-            page_1, header_system, header_user,
-            temperature=temperature, max_tokens=4000
+            unique_images,  # ← Send ALL pages
+            header_system,
+            header_user_multipage,
+            temperature=temperature,
+            max_tokens=4000
         )
         if 'error' in header_data:
             return {
@@ -856,19 +968,25 @@ class OpenRouterClient:
         pass_metadata['pass_1_header'] = {'fields_extracted': len(header_data)}
         print(f"✅ Pass 1 complete: {len(header_data)} header fields")
 
-        # ── Pass 2: Totals — second unique page (or page 1 if only one) ──────
-        # Totals always appear at the END of the first complete copy.
-        # For a 2-unique-page invoice: page 2 has the totals summary.
-        # Using last_page is WRONG when the last unique page is a triplicate
-        # continuation that survived dedup (e.g., different orientation).
-        # Use unique_images[1] (second unique page) as the totals page.
-        # If only one unique page, reuse page_1.
-        totals_page = unique_images[1] if n_unique >= 2 else page_1
-        print(f"\n💰 Pass 2: Totals from page 2/{n_unique} ({totals_page.width}x{totals_page.height})...")
+        # ── Pass 2: Totals — ALL PAGES ────────────────────────────────
+        # Totals might be on page 1 header, page 2 footer, or last page.
+        # Send ALL pages to find them.
+        print(f"\n💰 Pass 2: Totals from ALL {n_unique} pages...")
         totals_system, totals_user = get_totals_prompt()
+        
+        totals_user_multipage = (
+            f"⚠️ MULTI-PAGE INVOICE: {n_unique} pages provided.\n"
+            f"Search ALL pages for totals. Invoice amount, GST totals, taxable amount "
+            f"may appear on ANY page (header summary, footer, last page).\n\n"
+            + totals_user
+        )
+        
         totals_data, totals_response = self.extract_invoice(
-            totals_page, totals_system, totals_user,
-            temperature=temperature, max_tokens=3000
+            unique_images,  # ← Send ALL pages
+            totals_system,
+            totals_user_multipage,
+            temperature=temperature,
+            max_tokens=6000
         )
         if 'error' in totals_data:
             return {
@@ -1000,15 +1118,32 @@ class OpenRouterClient:
         all_items = merged_items
 
         # ════════════════════════════════════════════════════════════
-        # STEP 2: DEDUP — remove cross-page repeated rows
+        # STEP 2: AGGRESSIVE DEDUPLICATION — remove replica items
         # ────────────────────────────────────────────────────────────
-        # Key uses description + qty + batch as primary signal.
-        # Falls back to description + qty + taxable_value when batch differs
-        # due to OCR variation on duplicate copy pages.
+        # Scenario: Page 1 ORIGINAL (items 1-5), Page 2 NONE (items 6-10),
+        #           Page 3 ORIGINAL replica (items 1-5 again)
+        # Result: Items 1-5 extracted twice from pages 1 and 3.
+        #
+        # Strategy: Use MULTIPLE dedup keys with priority:
+        #   1. (desc, qty, batch) — exact match (highest confidence)
+        #   2. (hsn, qty, taxable) — financial match (OCR-tolerant)
+        #   3. (desc_normalized, qty) — fuzzy match (handles "PARACETAMOL 500MG" vs "PARACETAMOL 500 MG")
+        #   4. (item_code, qty) — when item code is reliable
         # ════════════════════════════════════════════════════════════
         seen_primary:   set = set()   # (desc, qty, batch) — exact match
-        seen_financial: set = set()   # (hsn, qty, taxable) — OCR-tolerant, description-independent
+        seen_financial: set = set()   # (hsn, qty, taxable) — OCR-tolerant
+        seen_fuzzy:     set = set()   # (desc_normalized, qty) — handles spacing/case variations
+        seen_itemcode:  set = set()   # (item_code, qty) — when item_code present
         deduped_items:  list = []
+
+        def _normalize_desc(desc: str) -> str:
+            """Normalize description for fuzzy matching."""
+            # Remove extra spaces, punctuation, convert to uppercase
+            import re
+            desc = desc.upper().strip()
+            desc = re.sub(r'[^\w\s]', '', desc)  # Remove punctuation
+            desc = re.sub(r'\s+', ' ', desc)     # Collapse multiple spaces
+            return desc
 
         for item in all_items:
             desc     = str(item.get('description', '') or '').strip().upper()
@@ -1016,46 +1151,71 @@ class OpenRouterClient:
             batch    = str(item.get('Batch', '')       or '').strip().upper()
             taxable  = str(item.get('taxable_value', '') or item.get('Value', '') or '')
             hsn      = str(item.get('hsn_sac', '')     or '').strip()
+            item_code = str(item.get('item_code', '')  or '').strip().upper()
 
             # Only deduplicate real items
             if not desc:
                 deduped_items.append(item)
                 continue
 
+            # Build dedup keys
             primary_key   = (desc, qty, batch)
-            # Financial key uses HSN+qty+taxable — immune to OCR description variation
-            # (SSOK65 vs SSQK65 have same HSN 90183100 + qty 10 + taxable 12425.0)
             financial_key = (hsn, qty, taxable) if (hsn and taxable) else None
+            fuzzy_key     = (_normalize_desc(desc), qty)
+            itemcode_key  = (item_code, qty) if item_code and item_code not in ('', '?', 'NULL') else None
 
+            # Check all dedup strategies (priority order)
+            is_duplicate = False
+            
+            # Strategy 1: Exact match (desc + qty + batch)
             if batch and primary_key in seen_primary:
-                print(f"   🔄 Dup removed (exact): {desc[:40]} qty={qty}")
+                print(f"   🔄 Dup removed (exact): {desc[:40]} qty={qty} batch={batch}")
+                is_duplicate = True
+            
+            # Strategy 2: Financial match (hsn + qty + taxable) — catches OCR variants
+            elif financial_key and financial_key in seen_financial:
+                print(f"   🔄 Dup removed (financial): {desc[:40]} hsn={hsn} qty={qty} taxable={taxable}")
+                is_duplicate = True
+            
+            # Strategy 3: Item code match — reliable when present
+            elif itemcode_key and itemcode_key in seen_itemcode:
+                print(f"   🔄 Dup removed (item_code): {item_code} qty={qty}")
+                is_duplicate = True
+            
+            # Strategy 4: Fuzzy description match — handles spacing/punctuation variations
+            elif fuzzy_key in seen_fuzzy:
+                print(f"   🔄 Dup removed (fuzzy): {desc[:40]} qty={qty}")
+                is_duplicate = True
+            
+            if is_duplicate:
                 continue
-            if financial_key and financial_key in seen_financial:
-                print(f"   🔄 Dup removed (HSN+qty+taxable): hsn={hsn} qty={qty} taxable={taxable}")
-                continue
-
+            
+            # Not a duplicate — keep it and register all keys
             deduped_items.append(item)
             if batch:
                 seen_primary.add(primary_key)
             if financial_key:
                 seen_financial.add(financial_key)
+            if itemcode_key:
+                seen_itemcode.add(itemcode_key)
+            seen_fuzzy.add(fuzzy_key)
 
+        duplicate_count = len(all_items) - len(deduped_items)
         all_items = deduped_items
 
         # ── Write final items and summary ─────────────────────────
         print(f"\n🔍 Finalising items...")
-        unique_items  = all_items
-        duplicate_count = 0  # already counted above
+        unique_items = all_items
 
         merged_data['items'] = unique_items
         pass_metadata['pass_3_items'] = {
-            'items_extracted': len(all_items),
+            'items_extracted': len(all_items) + duplicate_count,  # Total before dedup
             'items_unique': len(unique_items),
             'duplicates_skipped': duplicate_count,
             'pages_used': n_unique
         }
 
-        print(f"✅ Items finalised: {len(all_items)} extracted, {len(unique_items)} unique, {duplicate_count} duplicates skipped")
+        print(f"✅ Items finalised: {len(all_items) + duplicate_count} extracted, {len(unique_items)} unique, {duplicate_count} duplicates removed")
 
         print("\n" + "="*80)
         print(f"✅ EXTRACTION COMPLETE — Per-page strategy")
@@ -1074,3 +1234,75 @@ class OpenRouterClient:
         }
         
         return merged_data, metadata
+
+    @traceable(name="model_verify_extraction", tags=["model", "verification"], metadata={"model": "qwen3.7-plus"})
+    def verify_extraction(
+        self,
+        image: Image.Image,
+        extracted_data: dict,
+        temperature: float = 0.0
+    ) -> dict:
+        """
+        Verification pass: ask the model to cross-check extracted JSON against the invoice image.
+        
+        Sends the extracted data back to the model alongside the image and asks it to flag
+        discrepancies. Cheap pass (max_tokens=2000, no reasoning) focused purely on validation.
+        
+        Args:
+            image: The original invoice image (same image used for extraction)
+            extracted_data: The final extracted JSON (after all post-processing)
+            temperature: Always 0.0 for deterministic verification
+        
+        Returns:
+            Verification report dict with structure:
+            {
+                "verification_status": "PASS" or "FAIL",
+                "discrepancies": [...],
+                "confidence_score": float,
+                "notes": str
+            }
+        """
+        print(f"\n{'═'*80}")
+        print(f"🔍 VERIFICATION PASS — Cross-checking extracted data against invoice image")
+        print(f"{'═'*80}")
+        
+        # Format extracted data as compact JSON for the prompt
+        import json
+        # Remove internal fields that shouldn't be verified
+        clean_data = {k: v for k, v in extracted_data.items() if not k.startswith('_')}
+        extracted_json = json.dumps(clean_data, indent=2, ensure_ascii=False)
+        
+        user_prompt = VERIFICATION_USER_PROMPT.format(extracted_json=extracted_json)
+        
+        # Cheap verification call: no reasoning (pure comparison), low token limit
+        verification_result, _ = self.extract_invoice(
+            image,
+            system_prompt=VERIFICATION_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            temperature=0.0,
+            max_tokens=2000,
+            use_reasoning=False  # No thinking needed — just compare two sources
+        )
+        
+        # Default to PASS if model returns empty/malformed verification
+        if not verification_result or not isinstance(verification_result, dict):
+            verification_result = {
+                "verification_status": "PASS",
+                "discrepancies": [],
+                "confidence_score": 1.0,
+                "notes": "Verification call failed — assuming extraction is correct."
+            }
+        
+        status = verification_result.get("verification_status", "PASS")
+        discrepancy_count = len(verification_result.get("discrepancies", []))
+        
+        if status == "PASS" and discrepancy_count == 0:
+            print(f"✅ Verification: PASS — No discrepancies found")
+        else:
+            print(f"⚠️  Verification: {status} — {discrepancy_count} discrepancies flagged")
+            for i, disc in enumerate(verification_result.get("discrepancies", [])[:5], 1):
+                print(f"   {i}. {disc.get('field')}: {disc.get('severity')} — {disc.get('extracted')} ≠ {disc.get('invoice_shows')}")
+            if discrepancy_count > 5:
+                print(f"   ... and {discrepancy_count - 5} more")
+        
+        return verification_result

@@ -564,6 +564,31 @@ def extract_invoice():
             log_step(f"⚠️  Consistency check error (non-fatal): {consistency_error}")
 
         # ═══════════════════════════════════════════════════════════
+        # MODEL-BASED VERIFICATION — cross-check extracted JSON vs image
+        # Sends the extracted data + first page back to model for
+        # validation. Cheap pass (no reasoning, 2000 tokens) that flags
+        # discrepancies between what was extracted and what's visible.
+        # Result stored in _verification field for frontend display.
+        # ═══════════════════════════════════════════════════════════
+        log_step("Running model-based verification pass...")
+        try:
+            # Use the FIRST processed image (page 1) for verification
+            # since that's where header/totals typically are
+            verification_result = client.verify_extraction(
+                processed_images[0],
+                extracted_data
+            )
+            extracted_data['_verification'] = verification_result
+            status = verification_result.get('verification_status', 'UNKNOWN')
+            log_step(f"✅ Verification complete: {status}")
+        except Exception as verify_error:
+            log_step(f"⚠️  Verification error (non-fatal): {verify_error}")
+            extracted_data['_verification'] = {
+                'verification_status': 'ERROR',
+                'error': str(verify_error)
+            }
+
+        # ═══════════════════════════════════════════════════════════
         # ITEM-TO-HEADER RECONCILIATION
         # Sums item-level values and compares against printed invoice
         # totals. Produces a validation_status field in the response.
