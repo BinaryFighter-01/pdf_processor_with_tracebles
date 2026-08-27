@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Invoice Extractor</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  background: #F5F7FA;
+  min-height: 100vh;
+  padding: 0;
+}
+.container { max-width: 1600px; margin: 0 auto; }
+.header {
+  background: white;
+  border-bottom: 1px solid #E5E7EB;
+  padding: 24px 40px;
+  margin-bottom: 0;
+}
+.header h1 { font-size: 1.75rem; margin-bottom: 4px; font-weight: 600; color: #111827; }
+.header p { font-size: 0.95rem; color: #6B7280; }
+.main-content {
+  display: grid;
+  grid-template-columns: 420px 1fr;
+  gap: 32px;
+  padding: 32px 40px;
+}
+.card { background: white; border-radius: 16px; padding: 32px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+.upload-section h2 { font-size: 1.25rem; margin-bottom: 24px; color: #111827; font-weight: 600; }
+.drop-zone {
+  border: 2px dashed #D1D5DB;
+  border-radius: 16px;
+  padding: 48px 24px;
+  text-align: center;
+  background: #FAFBFC;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  margin-bottom: 24px;
+}
+.drop-zone:hover { border-color: #4F46E5; background: #F9FAFB; }
+.drop-zone.dragover { border-color: #4F46E5; background: #EEF2FF; border-width: 3px; }
+.drop-zone-icon { font-size: 3rem; margin-bottom: 16px; opacity: 0.7; }
+.drop-zone-text { font-size: 1.05rem; color: #374151; margin-bottom: 8px; font-weight: 500; }
+.drop-zone-subtext { font-size: 0.875rem; color: #9CA3AF; margin-bottom: 16px; }
+.drop-zone-formats { font-size: 0.8rem; color: #6B7280; font-weight: 500; }
+#fileInput { display: none; }
+.file-info {
+  background: #EEF2FF;
+  padding: 16px;
+  border-radius: 12px;
+  margin-bottom: 20px;
+  display: none;
+  border: 1px solid #C7D2FE;
+}
+.file-info.show { display: block; }
+.file-name { font-weight: 500; color: #1F2937; word-break: break-all; font-size: 0.9rem; }
+.file-meta { font-size: 0.85rem; color: #6B7280; margin-top: 8px; }
+.cache-option {
+  background: #F9FAFB;
+  border: 1px solid #E5E7EB;
+  padding: 16px;
+  border-radius: 12px;
+  margin-bottom: 24px;
+}
+.cache-option label { display: flex; align-items: center; cursor: pointer; font-size: 0.9rem; color: #374151; }
+.cache-option input[type="checkbox"] { margin-right: 12px; width: 18px; height: 18px; cursor: pointer; accent-color: #4F46E5; }
+.cache-option-tooltip { margin-top: 8px; margin-left: 30px; font-size: 0.8rem; color: #6B7280; line-height: 1.5; }
+.button-group { display: flex; gap: 12px; margin-bottom: 24px; }
+.btn { flex: 1; padding: 14px 24px; font-size: 0.95rem; font-weight: 600; border: none; border-radius: 12px; cursor: pointer; transition: all 0.2s ease; }
+.btn-primary { background: #4F46E5; color: white; }
+.btn-primary:hover:not(:disabled) { background: #4338CA; }
+.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-secondary { background: white; color: #6B7280; border: 2px solid #E5E7EB; }
+.btn-secondary:hover { background: #F9FAFB; border-color: #D1D5DB; }
+.formats-info { background: #F9FAFB; border: 1px solid #E5E7EB; padding: 16px; border-radius: 12px; font-size: 0.85rem; color: #6B7280; }
+.formats-info strong { display: block; margin-bottom: 8px; color: #374151; font-size: 0.9rem; }
+.results-section h2 { font-size: 1.25rem; margin-bottom: 24px; color: #111827; font-weight: 600; }
+.welcome-message { text-align: center; padding: 80px 40px; color: #9CA3AF; }
+.welcome-message-icon { font-size: 4rem; margin-bottom: 24px; opacity: 0.5; }
+.welcome-message h3 { font-size: 1.5rem; margin-bottom: 12px; color: #6B7280; font-weight: 600; }
+.welcome-message p { font-size: 0.95rem; color: #9CA3AF; }
+.tabs { display: flex; gap: 0; margin-bottom: 24px; border-bottom: 1px solid #E5E7EB; }
+.tab {
+  padding: 14px 24px;
+  background: none;
+  border: none;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #6B7280;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: all 0.2s ease;
+  position: relative;
+  top: 1px;
+}
+.tab:hover { color: #4F46E5; }
+.tab.active { color: #4F46E5; border-bottom-color: #4F46E5; }
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+.status-badges { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 24px; }
+.badge { padding: 6px 14px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; }
+.badge-success { background: #D1FAE5; color: #065F46; }
+.badge-info { background: #DBEAFE; color: #1E40AF; }
+.badge-warning { background: #FEF3C7; color: #92400E; }
+.badge-purple { background: #EDE9FE; color: #5B21B6; }
+.summary-section { margin-bottom: 32px; }
+.summary-section h3 { font-size: 1.05rem; color: #111827; margin-bottom: 16px; font-weight: 600; padding-bottom: 8px; border-bottom: 2px solid #F3F4F6; }
+.summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+.summary-item { background: #F9FAFB; padding: 16px; border-radius: 12px; border: 1px solid #F3F4F6; }
+.summary-label { font-size: 0.8rem; color: #6B7280; margin-bottom: 6px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
+.summary-value { font-size: 1.05rem; font-weight: 600; color: #111827; }
+.items-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.items-table th { background: #F9FAFB; padding: 12px; text-align: left; font-weight: 600; color: #374151; border-bottom: 2px solid #E5E7EB; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.5px; }
+.items-table td { padding: 12px; border-bottom: 1px solid #F3F4F6; color: #1F2937; }
+.items-table tr:hover { background: #F9FAFB; }
+.totals-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }
+.totals-card { background: #F9FAFB; padding: 20px; border-radius: 12px; border: 1px solid #F3F4F6; }
+.totals-card-label { font-size: 0.8rem; color: #6B7280; margin-bottom: 8px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
+.totals-card-value { font-size: 1.5rem; font-weight: 700; color: #111827; }
+.validation-list { display: flex; flex-direction: column; gap: 12px; }
+.validation-item { display: flex; align-items: center; gap: 12px; padding: 14px 16px; background: #F9FAFB; border-radius: 10px; border: 1px solid #E5E7EB; font-size: 0.9rem; }
+.validation-icon { font-size: 1.2rem; }
+.json-output {
+  background: #1E1E1E;
+  color: #D4D4D4;
+  padding: 24px;
+  border-radius: 12px;
+  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+  font-size: 0.85rem;
+  line-height: 1.6;
+  max-height: 600px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  border: 1px solid #E5E7EB;
+}
+.json-output .json-key { color: #9CDCFE; }
+.json-output .json-string { color: #CE9178; }
+.json-output .json-number { color: #B5CEA8; }
+.json-output .json-boolean { color: #569CD6; }
+.json-output .json-null { color: #569CD6; }
+.json-actions { display: flex; gap: 12px; margin-bottom: 16px; }
+.json-btn { padding: 10px 18px; background: #4F46E5; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 0.85rem; font-weight: 600; transition: background 0.2s; }
+.json-btn:hover { background: #4338CA; }
+.json-btn.secondary { background: #F3F4F6; color: #374151; }
+.json-btn.secondary:hover { background: #E5E7EB; }
+.loading { text-align: center; padding: 60px 40px; }
+.spinner {
+  border: 3px solid #F3F4F6;
+  border-top: 3px solid #4F46E5;
+  border-radius: 50%;
+  width: 48px;
+  height: 48px;
+  animation: spin 0.8s linear infinite;
+  margin: 0 auto 20px;
+}
+@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+.loading-message { font-size: 1.05rem; color: #374151; font-weight: 600; margin-bottom: 12px; }
+.loading-steps { margin-top: 24px; display: flex; flex-direction: column; gap: 10px; align-items: center; }
+.loading-step-item { display: flex; align-items: center; gap: 10px; font-size: 0.85rem; color: #6B7280; }
+.loading-step-item.complete { color: #059669; }
+.loading-step-item.active { color: #4F46E5; font-weight: 600; }
+.error-message { background: #FEF2F2; border-left: 4px solid #DC2626; color: #991B1B; padding: 16px 20px; border-radius: 8px; margin-bottom: 20px; }
+.error-message strong { display: block; margin-bottom: 8px; font-size: 1rem; }
+@media (max-width: 1200px) {
+  .main-content { grid-template-columns: 1fr; }
+  .summary-grid { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+}
+@media (max-width: 768px) {
+  .header { padding: 20px 24px; }
+  .main-content { padding: 24px; }
+  .card { padding: 24px; }
+  .header h1 { font-size: 1.4rem; }
+  .summary-grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>Invoice Extractor</h1>
+    <p>Fast &amp; Accurate Invoice Data Extraction</p>
+  </div>
+  <div class="main-content">
+    <!-- Upload Section -->
+    <div class="card upload-section">
+      <h2>Upload Invoice</h2>
+      <div class="drop-zone" id="dropZone">
+        <div class="drop-zone-icon">📄</div>
+        <div class="drop-zone-text">Drag &amp; Drop Invoice</div>
+        <div class="drop-zone-subtext">or</div>
+        <div class="drop-zone-subtext" style="margin-bottom: 16px; font-weight: 600; color: #4F46E5; text-decoration: underline;">Browse Files</div>
+        <div class="drop-zone-formats">Supported: PDF • JPG • PNG • TIFF • BMP • WebP<br>Maximum: 20 Pages</div>
+      </div>
+      <input type="file" id="fileInput" accept=".pdf,.png,.jpg,.jpeg,.tiff,.tif,.bmp,.webp">
+      <div class="file-info" id="fileInfo">
+        <div class="file-name" id="fileName"></div>
+        <div class="file-meta" id="fileMeta"></div>
+      </div>
+      <div class="cache-option">
+        <label>
+          <input type="checkbox" id="useCacheCheckbox" checked>
+          <span>Cache previous results</span>
+        </label>
+        <div class="cache-option-tooltip">Reuse previously extracted results when uploading the same invoice again to reduce processing time.</div>
+      </div>
+      <div class="button-group">
+        <button class="btn btn-primary" id="extractBtn" disabled>Extract Data</button>
+        <button class="btn btn-secondary" id="clearBtn">Clear</button>
+      </div>
+      <div class="formats-info">
+        <strong>Supported Formats</strong>
+        PDF, JPG, PNG, TIFF, BMP, WebP
+      </div>
+    </div>
+    <!-- Results Section -->
+    <div class="card results-section">
+      <h2>Extraction Results</h2>
+      <div id="welcomeMessage" class="welcome-message">
+        <div class="welcome-message-icon">📊</div>
+        <h3>Extraction Results</h3>
+        <p>Upload an invoice to begin extraction.<br>Results will appear here after processing.</p>
+      </div>
+      <div id="resultsContent" style="display: none;">
+        <div class="tabs">
+          <button class="tab active" data-tab="summary">Summary</button>
+          <button class="tab" data-tab="items">Items</button>
+          <button class="tab" data-tab="totals">Totals</button>
+          <button class="tab" data-tab="json">JSON</button>
+          <button class="tab" data-tab="validation">Validation</button>
+        </div>
+        <div class="tab-content active" id="summaryTab"><div id="summaryContent"></div></div>
+        <div class="tab-content" id="itemsTab"><div id="itemsContent"></div></div>
+        <div class="tab-content" id="totalsTab"><div id="totalsContent"></div></div>
+        <div class="tab-content" id="jsonTab">
+          <div class="json-actions">
+            <button class="json-btn" id="downloadJsonBtn">Download JSON</button>
+            <button class="json-btn secondary" id="copyJsonBtn">Copy to Clipboard</button>
+          </div>
+          <div class="json-output" id="jsonOutput"></div>
+        </div>
+        <div class="tab-content" id="validationTab"><div id="validationContent"></div></div>
+      </div>
+      <div id="loadingIndicator" style="display: none;">
+        <div class="loading">
+          <div class="spinner"></div>
+          <p class="loading-message">Analyzing Invoice...</p>
+          <div class="loading-steps" id="loadingSteps">
+            <div class="loading-step-item complete"><span>✓</span> Loading Document</div>
+            <div class="loading-step-item active"><span>⏳</span> Reading Pages</div>
+            <div class="loading-step-item"><span>○</span> Extracting Data</div>
+            <div class="loading-step-item"><span>○</span> Validating Results</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+// State
+let selectedFile = null;
+let extractedData = null;
+
+// Elements
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+const fileInfo = document.getElementById('fileInfo');
+const fileName = document.getElementById('fileName');
+const fileMeta = document.getElementById('fileMeta');
+const extractBtn = document.getElementById('extractBtn');
+const clearBtn = document.getElementById('clearBtn');
+const welcomeMessage = document.getElementById('welcomeMessage');
+const resultsContent = document.getElementById('resultsContent');
+const loadingIndicator = document.getElementById('loadingIndicator');
+const summaryContent = document.getElementById('summaryContent');
+const itemsContent = document.getElementById('itemsContent');
+const totalsContent = document.getElementById('totalsContent');
+const validationContent = document.getElementById('validationContent');
+const jsonOutput = document.getElementById('jsonOutput');
+const downloadJsonBtn = document.getElementById('downloadJsonBtn');
+const copyJsonBtn = document.getElementById('copyJsonBtn');
+
+// Drop zone handlers
+dropZone.addEventListener('click', () => fileInput.click());
+dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => { dropZone.classList.remove('dragover'); });
+dropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropZone.classList.remove('dragover');
+  if (e.dataTransfer.files.length) handleFileSelect(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', (e) => { if (e.target.files.length) handleFileSelect(e.target.files[0]); });
+
+function handleFileSelect(file) {
+  selectedFile = file;
+  fileName.textContent = file.name;
+  fileMeta.textContent = formatFileSize(file.size) + ' • Status: Ready';
+  fileInfo.classList.add('show');
+  extractBtn.disabled = false;
+}
+
+function formatFileSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+// Tab switching
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    const tabName = tab.dataset.tab;
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById(tabName + 'Tab').classList.add('active');
+  });
+});
+
+// Extract button
+extractBtn.addEventListener('click', () => {
+  const useCache = document.getElementById('useCacheCheckbox').checked;
+  performExtraction(useCache);
+});
+
+function updateLoadingSteps(step) {
+  const steps = ['Loading Document', 'Reading Pages', 'Extracting Data', 'Validating Results'];
+  const stepsContainer = document.getElementById('loadingSteps');
+  let html = '';
+  steps.forEach((stepName, index) => {
+    let className = 'loading-step-item';
+    let icon = '○';
+    if (index < step) { className += ' complete'; icon = '✓'; }
+    else if (index === step) { className += ' active'; icon = '⏳'; }
+    html += `<div class="${className}"><span>${icon}</span> ${stepName}</div>`;
+  });
+  stepsContainer.innerHTML = html;
+}
+
+async function performExtraction(useCache = true) {
+  if (!selectedFile) return;
+  extractBtn.disabled = true;
+  welcomeMessage.style.display = 'none';
+  resultsContent.style.display = 'none';
+  loadingIndicator.style.display = 'block';
+
+  let currentStep = 0;
+  updateLoadingSteps(currentStep);
+  const progressInterval = setInterval(() => {
+    currentStep++;
+    if (currentStep < 4) updateLoadingSteps(currentStep);
+  }, 1500);
+
+  const formData = new FormData();
+  formData.append('file', selectedFile);
+  formData.append('use_ocr', 'true');
+  formData.append('two_pass', 'true');
+  formData.append('multi_page', 'true');
+  formData.append('use_cache', useCache ? 'true' : 'false');
+
+  try {
+    const response = await fetch('/api/extract', { method: 'POST', body: formData });
+    const result = await response.json();
+    clearInterval(progressInterval);
+    updateLoadingSteps(4);
+    await new Promise(resolve => setTimeout(resolve, 500));
+    loadingIndicator.style.display = 'none';
+    resultsContent.style.display = 'block';
+    if (result.success) {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+      document.querySelector('[data-tab="summary"]').classList.add('active');
+      document.getElementById('summaryTab').classList.add('active');
+      displayResults(result);
+    } else {
+      displayError(result.error);
+    }
+  } catch (error) {
+    clearInterval(progressInterval);
+    loadingIndicator.style.display = 'none';
+    resultsContent.style.display = 'block';
+    displayError('Network error: ' + error.message);
+  }
+  extractBtn.disabled = false;
+}
+
+// Clear button
+clearBtn.addEventListener('click', () => {
+  selectedFile = null;
+  extractedData = null;
+  fileInput.value = '';
+  fileInfo.classList.remove('show');
+  extractBtn.disabled = true;
+  welcomeMessage.style.display = 'block';
+  resultsContent.style.display = 'none';
+  loadingIndicator.style.display = 'none';
+});
+
+function displayResults(result) {
+  extractedData = result.data;
+  const data = result.data;
+  const metadata = result.metadata;
+
+  // Badges
+  let badgesHTML = '<div class="status-badges">';
+  badgesHTML += '<span class="badge badge-success">✓ Extraction Complete</span>';
+  if (metadata.cached) badgesHTML += '<span class="badge badge-info">⚡ Cached Result</span>';
+  if (metadata.page_count && metadata.page_count > 1) badgesHTML += `<span class="badge badge-warning">📄 ${metadata.page_count} Pages</span>`;
+  if (metadata.processing_time) badgesHTML += `<span class="badge badge-purple">⏱ ${metadata.processing_time.toFixed(2)}s</span>`;
+  badgesHTML += '</div>';
+
+  // Summary Tab
+  let summaryHTML = badgesHTML;
+  summaryHTML += '<div class="summary-section"><h3>Invoice Information</h3><div class="summary-grid">';
+  summaryHTML += `<div class="summary-item"><div class="summary-label">Invoice Number</div><div class="summary-value">${data.invoice_number || 'N/A'}</div></div>`;
+  summaryHTML += `<div class="summary-item"><div class="summary-label">Invoice Date</div><div class="summary-value">${data.invoice_date || 'N/A'}</div></div>`;
+  summaryHTML += `<div class="summary-item"><div class="summary-label">PO Number</div><div class="summary-value">${data.PO_number || 'N/A'}</div></div>`;
+  summaryHTML += `<div class="summary-item"><div class="summary-label">Processing Time</div><div class="summary-value">${metadata.processing_time ? metadata.processing_time.toFixed(2) + 's' : 'N/A'}</div></div>`;
+  summaryHTML += '</div></div>';
+  summaryHTML += '<div class="summary-section"><h3>Parties</h3><div class="summary-grid">';
+  summaryHTML += `<div class="summary-item"><div class="summary-label">Seller Name</div><div class="summary-value">${data.seller_name || 'N/A'}</div></div>`;
+  summaryHTML += `<div class="summary-item"><div class="summary-label">Seller GSTIN</div><div class="summary-value">${data.seller_gstin || 'N/A'}</div></div>`;
+  summaryHTML += `<div class="summary-item"><div class="summary-label">Customer Name</div><div class="summary-value">${data.customer_name || 'N/A'}</div></div>`;
+  summaryHTML += `<div class="summary-item"><div class="summary-label">Customer GSTIN</div><div class="summary-value">${data.customer_gstin || 'N/A'}</div></div>`;
+  summaryHTML += '</div></div>';
+  summaryHTML += '<div class="summary-section"><h3>Quick Overview</h3><div class="summary-grid">';
+  summaryHTML += `<div class="summary-item"><div class="summary-label">Invoice Amount</div><div class="summary-value" style="color:#10B981;font-size:1.3rem;font-weight:700;">${data.invoice_amount || 'N/A'}</div></div>`;
+  summaryHTML += `<div class="summary-item"><div class="summary-label">Total Quantity</div><div class="summary-value">${(data.total_quantity || 0).toLocaleString('en-IN')}</div></div>`;
+  summaryHTML += `<div class="summary-item"><div class="summary-label">Total Items</div><div class="summary-value">${(data.items || []).length}</div></div>`;
+  summaryHTML += `<div class="summary-item"><div class="summary-label">Pages</div><div class="summary-value">${metadata.page_count || 1}</div></div>`;
+  summaryHTML += '</div></div>';
+  summaryContent.innerHTML = summaryHTML;
+
+  // Items Tab
+  let itemsHTML = '';
+  if (data.items && data.items.length > 0) {
+    itemsHTML += '<div style="overflow-x: auto;"><table class="items-table"><thead><tr>';
+    itemsHTML += '<th>Description</th><th>Batch</th><th>Qty</th><th>Unit Price</th><th>GST%</th><th>Amount</th><th>Item Code</th><th>HSN</th>';
+    itemsHTML += '</tr></thead><tbody>';
+    data.items.forEach(item => {
+      const isFree = item.free_item_yn === "1";
+      itemsHTML += `<tr style="${isFree ? 'background:#FEF3C7;' : ''}">`;
+      itemsHTML += `<td>${item.description || 'N/A'}${isFree ? ' <span style="color:#92400E;font-weight:600;font-size:0.75rem;">[FREE]</span>' : ''}</td>`;
+      itemsHTML += `<td>${item.Batch || 'N/A'}</td>`;
+      itemsHTML += `<td>${item.quantity || 0}</td>`;
+      itemsHTML += `<td>${item.unit_price || 'N/A'}</td>`;
+      itemsHTML += `<td>${item['Gst%'] !== null && item['Gst%'] !== undefined ? item['Gst%'] + '%' : 'N/A'}</td>`;
+      itemsHTML += `<td>${item.total_price || 'N/A'}</td>`;
+      itemsHTML += `<td>${item.item_code || 'N/A'}</td>`;
+      itemsHTML += `<td>${item.hsn_sac || 'N/A'}</td>`;
+      itemsHTML += '</tr>';
+    });
+    itemsHTML += '</tbody></table></div>';
+  } else {
+    itemsHTML = '<p style="color:#6B7280;text-align:center;padding:40px;">No items found</p>';
+  }
+  itemsContent.innerHTML = itemsHTML;
+
+  // Totals Tab
+  const fmt = (v) => v ? '₹' + parseFloat(v).toLocaleString('en-IN', {minimumFractionDigits: 2}) : 'N/A';
+  let totalsHTML = '<div class="totals-cards">';
+  totalsHTML += `<div class="totals-card"><div class="totals-card-label">Invoice Amount</div><div class="totals-card-value" style="color:#10B981;">${data.invoice_amount || 'N/A'}</div></div>`;
+  totalsHTML += `<div class="totals-card"><div class="totals-card-label">Taxable Amount</div><div class="totals-card-value">${fmt(data.taxable_amount)}</div></div>`;
+  totalsHTML += `<div class="totals-card"><div class="totals-card-label">Total GST Amount</div><div class="totals-card-value" style="color:#4F46E5;">${fmt(data.total_gst_amount)}</div></div>`;
+  totalsHTML += `<div class="totals-card"><div class="totals-card-label">Total GST Rate</div><div class="totals-card-value">${data.total_gst_rate !== null && data.total_gst_rate !== undefined ? data.total_gst_rate + '%' : 'N/A'}</div></div>`;
+  totalsHTML += `<div class="totals-card"><div class="totals-card-label">CGST Amount</div><div class="totals-card-value">${fmt(data.total_cgst_amount)}</div></div>`;
+  totalsHTML += `<div class="totals-card"><div class="totals-card-label">CGST Rate</div><div class="totals-card-value">${data.total_cgst_rate !== null && data.total_cgst_rate !== undefined ? data.total_cgst_rate + '%' : 'N/A'}</div></div>`;
+  totalsHTML += `<div class="totals-card"><div class="totals-card-label">SGST Amount</div><div class="totals-card-value">${fmt(data.total_sgst_amount)}</div></div>`;
+  totalsHTML += `<div class="totals-card"><div class="totals-card-label">SGST Rate</div><div class="totals-card-value">${data.total_sgst_rate !== null && data.total_sgst_rate !== undefined ? data.total_sgst_rate + '%' : 'N/A'}</div></div>`;
+  totalsHTML += `<div class="totals-card"><div class="totals-card-label">IGST Amount</div><div class="totals-card-value">${fmt(data.total_igst_amount)}</div></div>`;
+  totalsHTML += `<div class="totals-card"><div class="totals-card-label">IGST Rate</div><div class="totals-card-value">${data.total_igst_rate !== null && data.total_igst_rate !== undefined ? data.total_igst_rate + '%' : 'N/A'}</div></div>`;
+  totalsHTML += `<div class="totals-card"><div class="totals-card-label">Round Off</div><div class="totals-card-value" style="color:${(data.round_off || 0) < 0 ? '#DC2626' : '#10B981'};">${data.round_off !== null && data.round_off !== undefined ? '₹' + parseFloat(data.round_off).toFixed(2) : 'N/A'}</div></div>`;
+  totalsHTML += `<div class="totals-card"><div class="totals-card-label">Discount</div><div class="totals-card-value">${data.Discount || 'N/A'}</div></div>`;
+  totalsHTML += `<div class="totals-card"><div class="totals-card-label">Total Quantity</div><div class="totals-card-value">${(data.total_quantity || 0).toLocaleString('en-IN')}</div></div>`;
+  totalsHTML += '</div>';
+  totalsContent.innerHTML = totalsHTML;
+
+  // Validation Tab
+  let validationHTML = '<div class="validation-list">';
+  validationHTML += '<div class="validation-item"><span class="validation-icon">✓</span><span style="color:#059669;font-weight:600;">Extraction Completed Successfully</span></div>';
+  validationHTML += '<div class="validation-item"><span class="validation-icon">✓</span><span style="color:#059669;font-weight:600;">Invoice Parsed</span></div>';
+  if (data.items && data.items.length > 0)
+    validationHTML += `<div class="validation-item"><span class="validation-icon">✓</span><span style="color:#059669;font-weight:600;">Items Extracted (${data.items.length})</span></div>`;
+  if (metadata.page_count && metadata.page_count > 1)
+    validationHTML += `<div class="validation-item"><span class="validation-icon">✓</span><span style="color:#059669;font-weight:600;">Multi-Page Processing (${metadata.page_count} pages)</span></div>`;
+  if (metadata.cached)
+    validationHTML += '<div class="validation-item"><span class="validation-icon">⚡</span><span style="color:#1E40AF;font-weight:600;">Retrieved from Cache</span></div>';
+  if (data._validation_warnings && data._validation_warnings.length > 0)
+    data._validation_warnings.forEach(w => {
+      validationHTML += `<div class="validation-item"><span class="validation-icon">⚠</span><span style="color:#D97706;font-weight:600;">${w}</span></div>`;
+    });
+  validationHTML += '</div>';
+  validationContent.innerHTML = validationHTML;
+
+  // JSON Tab
+  displayFormattedJSON(result.data);
+  resultsContent.style.display = 'block';
+}
+
+function displayFormattedJSON(data) {
+  const jsonStr = JSON.stringify(data, null, 2);
+  jsonOutput.innerHTML = syntaxHighlight(jsonStr);
+}
+
+function syntaxHighlight(json) {
+  json = json.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return json.replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g, function(match) {
+    let cls = 'json-number';
+    if (/^"/.test(match)) { cls = /:$/.test(match) ? 'json-key' : 'json-string'; }
+    else if (/true|false/.test(match)) { cls = 'json-boolean'; }
+    else if (/null/.test(match)) { cls = 'json-null'; }
+    return '<span class="' + cls + '">' + match + '</span>';
+  });
+}
+
+function displayError(error) {
+  summaryContent.innerHTML = `<div class="error-message"><strong>Extraction Failed</strong><p style="margin-top:10px;">${error}</p></div>`;
+  itemsContent.innerHTML = '<p style="color:#6B7280;text-align:center;padding:40px;">No data available</p>';
+  totalsContent.innerHTML = '<p style="color:#6B7280;text-align:center;padding:40px;">No data available</p>';
+  validationContent.innerHTML = '<div class="validation-list"><div class="validation-item"><span class="validation-icon">✗</span><span style="color:#DC2626;font-weight:600;">Extraction Failed</span></div></div>';
+  jsonOutput.innerHTML = syntaxHighlight(JSON.stringify({error: error}, null, 2));
+  resultsContent.style.display = 'block';
+}
+
+// Download JSON
+downloadJsonBtn.addEventListener('click', () => {
+  if (!extractedData) return;
+  const dataStr = JSON.stringify(extractedData, null, 2);
+  const blob = new Blob([dataStr], {type: 'application/json'});
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `invoice_${extractedData.invoice_number || 'data'}_${Date.now()}.json`;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+});
+
+// Copy JSON
+copyJsonBtn.addEventListener('click', async () => {
+  if (!extractedData) return;
+  try {
+    await navigator.clipboard.writeText(JSON.stringify(extractedData, null, 2));
+    const orig = copyJsonBtn.textContent;
+    copyJsonBtn.textContent = 'Copied!';
+    copyJsonBtn.style.background = '#10B981';
+    setTimeout(() => { copyJsonBtn.textContent = orig; copyJsonBtn.style.background = ''; }, 2000);
+  } catch (err) { alert('Failed to copy to clipboard'); }
+});
+
+// Health check on load
+fetch('/api/health').then(r => r.json()).then(data => {
+  if (!data.api_configured) {
+    summaryContent.innerHTML = `<div class="error-message"><strong>API Key Not Configured</strong><p style="margin-top:10px;">Please add your API key to the .env file and restart the server.</p></div>`;
+    resultsContent.style.display = 'block';
+    welcomeMessage.style.display = 'none';
+  }
+}).catch(() => {});
+</script>
+</body>
+</html>

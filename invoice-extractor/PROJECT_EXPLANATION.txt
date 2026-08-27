@@ -1,0 +1,714 @@
+================================================================================
+                        INVOICE EXTRACTOR - PROJECT EXPLANATION
+                        AI-Powered Invoice Data Extraction System
+================================================================================
+
+PROJECT OVERVIEW
+----------------
+Invoice Extractor is a web-based application that automatically reads invoice
+images or PDFs and extracts all important data from them using Artificial
+Intelligence. Instead of manually typing invoice details, you simply upload the
+file and the system returns all fields as structured JSON data within seconds.
+
+The system is built to handle real-world Indian pharmaceutical and hospital
+invoices which are complex - they have multiple pages, free items (bonus
+quantities), GST breakdowns, PO numbers hidden in remarks, and rotated scans.
+
+--------------------------------------------------------------------------------
+TECH STACK
+--------------------------------------------------------------------------------
+
+  Backend  : Python 3.11, Flask (web framework)
+  Frontend : HTML, CSS, JavaScript (single file, no frameworks)
+  AI Model : Qwen Vision Model (via OpenRouter API)
+  OCR      : Baidu Qianfan OCR (via OpenRouter API, free tier)
+  PDF      : PyMuPDF (converts PDF pages to images)
+  Image    : OpenCV + Pillow (rotation, contrast, sharpening)
+  Cache    : File-based SHA-256 hash cache (JSON files)
+  Hosting  : Local server (can be exposed via ngrok for public access)
+
+--------------------------------------------------------------------------------
+SYSTEM ARCHITECTURE - HOW DATA FLOWS
+--------------------------------------------------------------------------------
+
+  1. User uploads invoice (PDF / JPG / PNG / TIFF / BMP / WebP)
+         |
+  2. app_web.py receives file
+         |
+  3. cache_manager.py checks if same file was processed before
+     --> If YES: return cached result instantly (skip all steps below)
+     --> If NO: continue
+         |
+  4. pdf_utils.py converts PDF pages to images (if PDF)
+         |
+  5. preprocessing.py cleans each image:
+         |-- ocr_client.py detects if image is rotated (0/90/180/270 degrees)
+         |-- Applies rotation correction
+         |-- Applies contrast enhancement (CLAHE)
+         |
+  6. model_client.py sends image to AI model (3 separate API calls):
+         |-- Call 1: Extract header fields only  (invoice no, date, PO, seller, buyer)
+         |-- Call 2: Extract totals only          (GST amounts, invoice amount, round off)
+         |-- Call 3: Extract line items only      (products, batch, qty, price, HSN)
+         |   (For multi-page: all pages combined into one tall image before sending)
+         |
+  7. app_web.py normalizes data types (converts strings to numbers, cleans symbols)
+         |
+  8. gst_enrichment.py fills missing GST fields per item
+         |
+  9. free_item_splitter.py splits "20+2" quantities into 2 separate records
+         |
+ 10. gst_calculator.py validates GST consistency
+         |
+ 11. cache_manager.py saves result for future reuse
+         |
+ 12. JSON response sent back to browser
+         |
+ 13. templates/index.html displays result in 5 tabs
+
+--------------------------------------------------------------------------------
+FILE-BY-FILE EXPLANATION
+--------------------------------------------------------------------------------
+
+1. app_web.py
+   -----------
+   Role    : Main server file - the backbone of the entire application
+   Type    : Python / Flask
+
+   This is where everything starts and ends. It runs the web server and
+   contains the main API endpoint (/api/extract) that handles file uploads.
+
+   Key responsibilities:
+   - Starts Flask web server on port 5000
+   - Receives uploaded files from the browser
+   - Orchestrates the full extraction pipeline (steps 3-12 above)
+   - Performs type normalization (e.g., "3,053.68" becomes 3053.68)
+   - Formats dates to DD/MM/YYYY format
+   - Adds invoice_id and currency_code to output
+   - Calculates total_quantity by summing ONLY paid items (not free items)
+   - Returns final JSON response to browser
+   - Also serves /api/health endpoint to check if API key is configured
+
+   Configuration it reads from .env file:
+   - OPENROUTER_API_KEY (required)
+   - MODEL_NAME (which AI model to use)
+   - CACHE_ENABLED, CACHE_MAX_AGE_HOURS
+   - MAX_PDF_PAGES (default: 20)
+
+
+2. schema.py
+   ----------
+   Role    : AI prompt definitions - instructions given to the AI model
+   Type    : Python (contains only text strings, no logic)
+
+   This file is the most important for extraction accuracy. It contains
+   carefully written instructions that tell the AI exactly how to read an
+   invoice. Think of it as the "rulebook" for the AI.
+
+   Contains:
+   - SYSTEM_PROMPT : Tells AI its role ("You are an OCR extraction engine,
+                     output only valid JSON, first character must be {")
+                     Also contains multi-page rules, null value policy,
+                     global field search rules, and core principles.
+
+   - USER_PROMPT   : Full extraction rules for every field. Covers:
+                     * Where to search for PO number (header, remarks, footer,
+                       last page - check ALL locations before returning null)
+                     * How to handle expiry dates (MM/YY → DD-MM-YYYY)
+                     * How to detect free items (FREE/BONUS/SCHEME columns)
+                     * Item code extraction from description brackets
+                     * GST derivation rules when columns are missing
+                     * Value vs taxable_value distinction
+                     * Batch number normalization
+
+   - get_header_prompt()  : Focused prompt - extract ONLY header fields
+   - get_totals_prompt()  : Focused prompt - extract ONLY financial totals
+   - get_items_prompt()   : Focused prompt - extract ONLY line items
+
+   Why 3 separate prompts? Because the AI performs better when focused on
+   one specific task rather than trying to extract everything at once.
+   This is called the "3-pass extraction strategy".
+
+
+3. model_client.py
+   ----------------
+   Role    : Communicates with the AI model via OpenRouter API
+   Type    : Python
+
+   This file handles all network communication with the AI. It sends invoice
+   images to the AI and receives the extracted JSON data back.
+
+   Key methods:
+
+   extract_invoice()
+   - Converts PIL image to base64 string
+   - Sends HTTP POST request to OpenRouter API with image + prompts
+   - Parses JSON from AI response
+   - Has repair_json() to fix common AI mistakes (missing brackets,
+     trailing commas, unquoted property names)
+   - Retry logic: retries up to 2 times on timeout
+   - Handles API errors: 402 (no credits), 401 (bad key), 429 (rate limit)
+
+   extract_invoice_two_pass()
+   - Used for single-page invoices
+   - Makes 3 API calls: header (500 tokens) → totals (300 tokens) → items (3000 tokens)
+   - Merges all 3 results into one complete JSON
+
+   extract_invoice_multipage()
+   - Used for multi-page PDFs
+   - CRITICAL DESIGN: Instead of processing pages separately, it combines
+     ALL pages into one tall image (stacked vertically)
+   - Then makes 3 API calls, each time sending the complete document
+   - This ensures fields like PO number on the last page are never missed
+   - After extraction, runs duplicate detection to remove repeated items
+     that sometimes appear at page boundaries
+
+
+4. ocr_client.py
+   --------------
+   Role    : Detects invoice rotation using Baidu Qianfan OCR model
+   Type    : Python
+
+   Many invoices are scanned sideways or upside down. This file detects
+   the rotation before sending to the main AI model.
+
+   Key methods:
+
+   detect_orientation()
+   - Sends image to Baidu Qianfan OCR (free model via OpenRouter)
+   - Asks: "Is this document rotated 0, 90, 180, or 270 degrees?"
+   - Returns (rotation_angle, confidence_score)
+   - If confidence is too low, preprocessing.py falls back to heuristic method
+
+   extract_text()
+   - Extracts raw text from image (not used in main pipeline but available)
+
+
+5. pdf_utils.py
+   -------------
+   Role    : Converts PDF files into images
+   Type    : Python
+
+   The AI vision model cannot read PDF files directly. It only understands
+   images. This file handles the conversion.
+
+   Functions:
+
+   pdf_to_images(pdf_path, dpi=150)
+   - Opens PDF using PyMuPDF library
+   - Renders each page as a PNG image at 150 DPI
+   - Returns list of PIL Image objects (one per page)
+   - Skips pages that fail to render (with warning)
+
+   get_pdf_page_count(pdf_path)
+   - Simply returns how many pages a PDF has
+
+
+6. preprocessing.py
+   -----------------
+   Role    : Cleans and prepares invoice images for AI extraction
+   Type    : Python
+
+   Raw scanned images are often imperfect. This file improves image quality
+   before sending to the AI, which directly improves extraction accuracy.
+
+   Classes:
+
+   OrientationDetector
+   - Tries Qianfan OCR first for rotation detection (most accurate)
+   - Falls back to heuristic if OCR unavailable or fails:
+     * Checks if image is portrait (may need rotation)
+     * Measures ink density at top vs bottom
+     * Invoice headers always have more ink at top (logo, company name)
+   - Corrects rotation using OpenCV
+
+   ImagePreprocessor.process()
+   - Full preprocessing pipeline:
+     Step 1: Orientation correction (fixes 90/180/270 degree rotations)
+     Step 2: Skew correction (fixes slightly tilted scans using Hough lines)
+     Step 3: Contrast enhancement (CLAHE - makes faded text clearer)
+     Step 4: Optional denoising (smooths noise but can blur text)
+     Step 5: Optional sharpening (makes text edges crisper)
+   - For multi-page PDFs, rotation detection only runs on page 1 (saves API calls)
+
+
+7. cache_manager.py
+   -----------------
+   Role    : Caches extraction results to avoid reprocessing same invoices
+   Type    : Python
+
+   If you upload the same invoice twice, there's no reason to call the AI again
+   and waste time and API credits. This file handles intelligent caching.
+
+   How it works:
+   - When a file is uploaded, generates SHA-256 hash of: file bytes + options
+   - Checks uploads/.cache/ folder for a JSON file with that hash
+   - If found and not expired: returns cached result immediately
+   - If not found: processes normally, saves result as {hash}.json
+
+   Key methods:
+   generate_cache_key() - Creates unique fingerprint for file + options
+   get()               - Retrieves cached result if valid
+   set()               - Stores new result in cache
+   clear()             - Deletes old/all cache entries
+   get_stats()         - Returns count, total size, age of cache entries
+
+   Cache settings (from .env):
+   - CACHE_ENABLED=true
+   - CACHE_MAX_AGE_HOURS=24 (entries expire after 24 hours)
+   - CACHE_DIRECTORY=uploads/.cache
+
+
+8. free_item_splitter.py
+   ----------------------
+   Role    : Splits free/bonus items into separate invoice records
+   Type    : Python
+
+   Pharmaceutical invoices frequently include free items with purchases.
+   Example: "Buy 20 tablets, get 2 free" shown as quantity "20+2"
+
+   The system splits this into 2 separate line items:
+   - Record 1: quantity=20, free_item_yn="0" (paid item, keeps original prices)
+   - Record 2: quantity=2,  free_item_yn="1" (free item, proportional prices)
+
+   Handles 3 patterns:
+   1. Combined format  : quantity = "20+2" (string with plus sign)
+   2. Separate columns : quantity = 20, free_quantity = 2 (two fields)
+   3. No free items    : quantity = 20 (normal item, just adds free_item_yn="0")
+
+   create_proportional_item()
+   - UNCHANGED fields (same on both records):
+     description, Pack, Batch, hsn_sac, item_code, expiry_date,
+     unit_price, Gst%, MRP, cgst_rate, sgst_rate, igst_rate, Discount
+   - RECALCULATED fields (proportional to new quantity):
+     total_price = unit_price × new_quantity
+     Value, taxable_value, GST_AMT, cgst_amount, sgst_amount, igst_amount
+     (all scaled by new_qty / paid_qty ratio)
+
+   After splitting, app_web.py calculates total_quantity as sum of ONLY
+   paid items (free_item_yn = "0"), which is the correct business figure.
+
+
+9. gst_calculator.py
+   ------------------
+   Role    : GST validation and enrichment following Indian tax rules
+   Type    : Python
+
+   Handles all Indian GST business logic.
+
+   Key rules implemented:
+   - Intra-state transaction: CGST + SGST (split equally, both same rate)
+   - Inter-state transaction: IGST only (no CGST or SGST)
+   - CGST must always equal SGST for intra-state
+
+   determine_transaction_type()
+   - If invoice has CGST/SGST amounts → intra-state
+   - If invoice has IGST amounts → inter-state
+   - Default: intra-state (most common for pharma invoices)
+
+   enrich_item_with_gst()
+   - Does NOT overwrite values extracted from invoice
+   - Only fills GST_AMT if it's missing but CGST + SGST are available
+
+   calculate_invoice_totals()
+   - Fills total_gst_amount if missing: CGST + SGST + IGST
+   - Fills GST rates from item-level data if missing at header level
+   - Does NOT touch invoice_amount or taxable_amount (those come from AI)
+
+   validate_gst()
+   - Checks CGST equals SGST (with 2 paisa tolerance for rounding)
+   - Returns validation report with errors and warnings
+
+   _calculate_confidence()
+   - Scores 0.0 to 1.0 based on data completeness
+   - Reduces score for missing GSTIN, calculated vs extracted values, etc.
+
+
+10. gst_enrichment.py
+    ------------------
+    Role    : Per-item GST derivation for invoices with incomplete GST columns
+    Type    : Python
+
+    Some invoices don't have per-item GST columns. This file derives the
+    missing values using whatever data is available.
+
+    enrich_item_gst() - Priority hierarchy:
+    1. Invoice has explicit CGST + SGST amounts → keep them, source = "invoice"
+    2. Has GST_AMT and Gst% → split GST_AMT into CGST+SGST (or assign to IGST)
+    3. Has Value and Gst% → calculate GST_AMT = Value × Gst% ÷ 100, then split
+    4. Nothing available → mark as "not_calculated", leave null
+
+    enrich_totals_gst()
+    - Fixes common AI mistake: AI sometimes sets total_gst_rate=5 when it
+      should be 10 (because CGST=5 and SGST=5, total=10)
+    - Corrects total_gst_rate = total_cgst_rate + total_sgst_rate
+
+    enrich_gst_comprehensive()
+    - Main entry point called by app_web.py
+    - Runs the full enrichment pipeline on the entire invoice
+
+
+11. templates/index.html
+    ---------------------
+    Role    : The complete web user interface
+    Type    : HTML + CSS + JavaScript (single file)
+
+    Everything the user sees and interacts with is in this file.
+
+    Layout:
+    - Fixed header bar (title + subtitle)
+    - Two-column grid: upload panel (left) + results panel (right)
+    - Responsive: collapses to single column on smaller screens
+
+    Upload Panel features:
+    - Drag & drop zone (click or drag file onto it)
+    - Shows file name and size after selection
+    - "Cache previous results" checkbox with explanation tooltip
+    - Extract button (disabled until file selected) + Clear button
+    - Supported formats notice
+
+    Results Panel - 5 tabs:
+    Tab 1: Summary
+           - Status badges (Extraction Complete, Cached, Page Count, Time)
+           - Invoice Information card grid (number, date, PO number)
+           - Parties card grid (seller name, seller GSTIN, customer name, GSTIN)
+           - Quick Overview grid (invoice amount, total qty, item count, pages)
+
+    Tab 2: Items
+           - Full scrollable table with all line items
+           - Columns: Description, Batch, Qty, Unit Price, GST%, Amount,
+                      Item Code, HSN
+           - Free items highlighted in yellow with [FREE] badge
+
+    Tab 3: Totals
+           - Card grid showing all financial totals:
+             Invoice Amount, Taxable Amount, Total GST, GST Rate,
+             CGST Amount, CGST Rate, SGST Amount, SGST Rate,
+             IGST Amount, IGST Rate, Round Off, Discount, Total Quantity
+
+    Tab 4: JSON
+           - Syntax-highlighted raw JSON in dark theme (VS Code style)
+           - Download JSON button (saves as invoice_{number}_{timestamp}.json)
+           - Copy to Clipboard button
+
+    Tab 5: Validation
+           - Checklist: extraction success, items count, multi-page status,
+             cache status, any warnings from processing
+
+    JavaScript functions:
+    - handleFileSelect()     : Updates UI when file chosen
+    - performExtraction()    : Sends file to /api/extract, animates loading steps
+    - updateLoadingSteps()   : Animates the 4-step loading indicator
+    - displayResults()       : Renders all 5 tabs with extracted data
+    - syntaxHighlight()      : Colors JSON keys, strings, numbers, nulls
+    - displayError()         : Shows error state across all tabs
+
+
+12. .env
+    ----
+    Role    : Secret configuration file (never shared or committed to Git)
+    Type    : Environment variables
+
+    Contains:
+    OPENROUTER_API_KEY=sk-or-...  (your API key - keep secret)
+    MODEL_NAME=qwen/qwen2.5-vl-72b-instruct
+    CACHE_ENABLED=true
+    CACHE_MAX_AGE_HOURS=24
+    MAX_PDF_PAGES=20
+
+
+13. .env.example
+    ------------
+    Role    : Template showing what variables are needed (safe to share)
+    Type    : Environment variables template
+
+    New developers copy this file to .env and fill in their own values.
+
+
+14. requirements.txt
+    ----------------
+    Role    : List of Python packages needed to run the project
+    Type    : Plain text
+
+    Install all with: pip install -r requirements.txt
+
+    Packages:
+    Flask==3.0.0            - Web framework
+    Pillow==10.4.0          - Image processing (PIL)
+    opencv-python-headless  - Image processing (rotation, contrast, skew)
+    numpy==1.26.4           - Numerical operations for image arrays
+    scipy==1.13.1           - Scientific computing (used in image analysis)
+    pymupdf==1.24.9         - PDF to image conversion
+    imagehash==4.3.1        - Perceptual image hashing
+    requests==2.32.3        - HTTP requests to OpenRouter API
+    python-dotenv==1.0.1    - Reads .env file into environment variables
+
+
+15. start.bat
+    ---------
+    Role    : One-click startup script for Windows
+    Type    : Windows batch file
+
+    Double-click this file to start the server.
+    Opens the browser automatically at http://localhost:5000
+
+
+16. README.md
+    ---------
+    Role    : Project documentation
+    Type    : Markdown
+
+
+17. .gitignore
+    ----------
+    Role    : Tells Git which files to NOT track or commit
+    Type    : Git config
+
+    Excludes: .env (secrets), uploads/, __pycache__/, .cache/
+
+
+18. uploads/ folder
+    ---------------
+    Role    : Temporary storage for uploaded files during processing
+    Contains: Uploaded invoice files + .cache/ subfolder for cached results
+
+
+19. __pycache__/ folder
+    -------------------
+    Role    : Python bytecode cache (auto-generated by Python, safe to ignore)
+    Type    : Compiled .pyc files
+
+
+--------------------------------------------------------------------------------
+KEY FEATURES EXPLAINED
+--------------------------------------------------------------------------------
+
+FEATURE 1: 3-PASS EXTRACTION STRATEGY
+---------------------------------------
+Instead of asking the AI to extract everything in one shot, the system makes
+3 focused API calls per invoice:
+
+  Pass 1 - Header fields (500 max tokens):
+  Extracts: invoice_number, invoice_date, customer_name, seller_name,
+            customer_gstin, seller_gstin, PO_number, DC_number, DC_date
+
+  Pass 2 - Financial totals (300 max tokens):
+  Extracts: invoice_amount, taxable_amount, total_gst_amount,
+            total_cgst_rate, total_cgst_amount, total_sgst_rate,
+            total_sgst_amount, round_off, total_quantity
+
+  Pass 3 - Line items (3000-4000 max tokens):
+  Extracts: Full items array with description, batch, quantity,
+            unit_price, total_price, HSN, GST%, expiry_date, etc.
+
+Why 3 passes? Accuracy improves significantly when the AI is focused on
+one task. Also, if one pass fails, the other results are still available.
+
+
+FEATURE 2: PAGE-AGNOSTIC MULTI-PAGE EXTRACTION
+------------------------------------------------
+Old approach (wrong): Process page 1 for header, pages 2-N for items only.
+Problem: PO number on last page → missed. Totals on last page → missed.
+
+New approach (correct): Combine ALL pages into one tall vertical image.
+Send the entire document to each of the 3 passes.
+Result: AI sees complete document context for every field extraction.
+This is why PO numbers in remarks sections on any page are always found.
+
+
+FEATURE 3: FREE ITEM HANDLING
+------------------------------
+Pharmaceutical invoices show bonus quantities as "20+2" in a single cell.
+The system:
+1. AI extracts quantity as string "20+2"
+2. free_item_splitter.py splits into 2 records
+3. Paid record: qty=20, free_item_yn="0", full prices
+4. Free record:  qty=2,  free_item_yn="1", proportional prices
+5. total_quantity counts only paid items = 20
+
+
+FEATURE 4: SMART CACHING
+--------------------------
+SHA-256 hash is computed from: file bytes + extraction options
+Same invoice + same settings = same hash = instant response from cache
+Different invoice OR different options = different hash = fresh extraction
+Cache expires after 24 hours (configurable)
+Cache shown in UI as "⚡ Cached Result" badge
+
+
+FEATURE 5: IMAGE PREPROCESSING PIPELINE
+-----------------------------------------
+Before sending to AI, every image goes through:
+1. Rotation detection (via Qianfan OCR model - asks "is this rotated?")
+2. Rotation correction (using OpenCV)
+3. Contrast enhancement (CLAHE algorithm - adaptive histogram equalization)
+This means even sideways, upside-down, or faded invoice scans work correctly.
+
+
+FEATURE 6: JSON REPAIR
+------------------------
+Sometimes the AI returns slightly broken JSON (missing bracket, trailing comma).
+model_client.py has repair_json() that:
+- Removes trailing commas before closing brackets
+- Balances unmatched { } and [ ] brackets
+- Strips any text before { or after }
+- Converts unquoted property names to quoted
+
+
+--------------------------------------------------------------------------------
+JSON OUTPUT STRUCTURE
+--------------------------------------------------------------------------------
+
+{
+  "invoice_id"         : "INV001",
+  "invoice_number"     : "INV001",
+  "invoice_date"       : "15/06/2026",
+  "due_date"           : null,
+  "customer_name"      : "DEENANATH MANGESHKAR HOSPITAL",
+  "customer_gstin"     : "27AIWPA8054A1ZA",
+  "seller_name"        : "MEHTA PHARMA PVT LTD",
+  "seller_gstin"       : "27AAAFM1944N1ZN",
+  "currency_code"      : "INR",
+  "PO_number"          : "DMH/PO/PHRMCY/2026-27/3906",
+  "DC_date"            : null,
+  "DC_number"          : null,
+  "invoice_amount"     : 15420.50,
+  "round_off"          : -0.50,
+  "total_gst_rate"     : 12,
+  "total_quantity"     : 150,
+  "total_cgst_rate"    : 6,
+  "total_cgst_amount"  : 825.00,
+  "total_sgst_rate"    : 6,
+  "total_sgst_amount"  : 825.00,
+  "total_igst_rate"    : null,
+  "total_igst_amount"  : 0,
+  "total_gst_amount"   : 1650.00,
+  "items": [
+    {
+      "description"    : "PARACETAMOL 500MG",
+      "Pack"           : "10TAB",
+      "Batch"          : "AB1234",
+      "quantity"       : 20,
+      "free_item_yn"   : "0",
+      "unit_price"     : 48.71,
+      "total_price"    : 974.20,
+      "reference_number": null,
+      "hsn_sac"        : "30049099",
+      "item_code"      : "SR-02-0391",
+      "expiry_date"    : "30/11/2027",
+      "Discount"       : 5.0,
+      "Discount_type"  : "percent",
+      "Value"          : 925.49,
+      "Gst%"           : 12,
+      "MRP"            : 60.00,
+      "cgst_rate"      : 6,
+      "cgst_amount"    : 55.53,
+      "sgst_rate"      : 6,
+      "sgst_amount"    : 55.53,
+      "igst_rate"      : null,
+      "igst_amount"    : null,
+      "GST_AMT"        : 111.06,
+      "taxable_value"  : 925.49
+    }
+  ]
+}
+
+
+--------------------------------------------------------------------------------
+HOW TO RUN THE PROJECT
+--------------------------------------------------------------------------------
+
+Step 1: Install Python 3.11+
+
+Step 2: Install dependencies
+        pip install -r requirements.txt
+
+Step 3: Set up API key
+        Copy .env.example to .env
+        Add your OpenRouter API key: OPENROUTER_API_KEY=sk-or-xxxxx
+        Get key from: https://openrouter.ai/keys
+
+Step 4: Start server
+        Double-click start.bat   (Windows)
+        OR run: python app_web.py
+
+Step 5: Open browser
+        Go to: http://localhost:5000
+
+Step 6: Upload invoice
+        Drag & drop or click to upload PDF/image
+        Click "Extract Data"
+        View results in 5 tabs
+
+
+--------------------------------------------------------------------------------
+API ENDPOINTS
+--------------------------------------------------------------------------------
+
+GET  /
+     Serves the web interface (index.html)
+
+POST /api/extract
+     Extracts data from uploaded invoice
+     Form fields:
+       file       : The invoice file (PDF/image)
+       use_ocr    : "true" / "false" (always true in current UI)
+       two_pass   : "true" / "false" (always true in current UI)
+       multi_page : "true" / "false" (always true in current UI)
+       use_cache  : "true" / "false" (from checkbox in UI)
+     Returns: JSON with success, data, metadata, reasoning
+
+GET  /api/health
+     Returns API configuration status
+     Used by UI on load to check if API key is set
+
+
+--------------------------------------------------------------------------------
+SUPPORTED INPUT FORMATS
+--------------------------------------------------------------------------------
+
+  PDF   - Single or multi-page (up to 20 pages)
+  JPG   - Standard JPEG images
+  PNG   - PNG images
+  TIFF  - TIFF images (common in scanners)
+  BMP   - Bitmap images
+  WebP  - Modern web image format
+
+Maximum file size: 20 MB
+
+
+--------------------------------------------------------------------------------
+PROJECT FOLDER STRUCTURE
+--------------------------------------------------------------------------------
+
+invoice-extractor/
+|
+|-- app_web.py              Main Flask server
+|-- schema.py               AI prompts and extraction rules
+|-- model_client.py         OpenRouter API communication
+|-- ocr_client.py           Qianfan OCR for rotation detection
+|-- pdf_utils.py            PDF to image conversion
+|-- preprocessing.py        Image cleaning pipeline
+|-- cache_manager.py        Result caching system
+|-- free_item_splitter.py   Free/bonus item splitting
+|-- gst_calculator.py       GST validation and enrichment
+|-- gst_enrichment.py       Per-item GST derivation
+|
+|-- templates/
+|   |-- index.html          Complete web UI
+|
+|-- uploads/                Temporary uploaded files
+|   |-- .cache/             Cached extraction results (JSON files)
+|
+|-- .env                    Secret config (API key) - never share
+|-- .env.example            Config template - safe to share
+|-- requirements.txt        Python package list
+|-- start.bat               One-click Windows startup
+|-- README.md               Documentation
+|-- .gitignore              Git exclusions
+|-- __pycache__/            Python bytecode (auto-generated)
+
+
+--------------------------------------------------------------------------------
+                              END OF DOCUMENT
+================================================================================
