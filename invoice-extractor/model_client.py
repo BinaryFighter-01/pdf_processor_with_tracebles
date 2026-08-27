@@ -82,46 +82,52 @@ class OpenRouterClient:
         return json_str
     
     @staticmethod
-    def image_to_base64(pil_image: Image.Image, format: str = 'PNG', max_size: int = 4096) -> str:
+    def image_to_base64(pil_image: Image.Image, format: str = 'PNG', max_size: int = 8192) -> str:
         """
-        Convert PIL Image to base64 string with size optimization.
-        
+        Convert PIL Image to base64 string at maximum quality.
+
+        Always uses PNG (lossless) regardless of image size — JPEG compression
+        degrades fine text (batch numbers, HSN codes, small-print amounts) and
+        directly causes OCR errors. Token cost is not a constraint, accuracy is.
+
         Args:
             pil_image: PIL Image object
-            format: Image format (PNG or JPEG)
-            max_size: Maximum dimension (width or height)
+            format: Ignored — always PNG for lossless quality
+            max_size: Maximum dimension in pixels (default 8192; covers 300-DPI A4 at full res)
         """
-        # Resize if image is too large
+        # Always PNG — lossless preserves every pixel of fine invoice text
+        format = 'PNG'
+
+        # Ensure RGB (PNG handles RGB cleanly; RGBA would add unnecessary alpha)
+        if pil_image.mode not in ('RGB', 'L'):
+            pil_image = pil_image.convert('RGB')
+
         width, height = pil_image.size
+
+        # Downscale only if genuinely oversized (e.g. 600 DPI scan > 8192 px)
         if width > max_size or height > max_size:
-            # Calculate new size maintaining aspect ratio
             if width > height:
-                new_width = max_size
+                new_width  = max_size
                 new_height = int(height * (max_size / width))
             else:
                 new_height = max_size
-                new_width = int(width * (max_size / height))
-            
+                new_width  = int(width * (max_size / height))
             pil_image = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            print(f"🔄 Image resized from {width}x{height} to {new_width}x{new_height}")
-        
-        # Convert to base64
+            print(f"🔄 Image resized from {width}x{height} to {new_width}x{new_height} (still lossless PNG)")
+        else:
+            print(f"📐 Image at full resolution: {width}x{height} px — no resize needed")
+
         buffered = BytesIO()
-        
-        # Use JPEG for larger images to reduce size
-        if width * height > 1000000:  # If > 1MP, use JPEG
-            format = 'JPEG'
-            pil_image = pil_image.convert('RGB')  # JPEG doesn't support transparency
-        
-        pil_image.save(buffered, format=format, quality=85 if format == 'JPEG' else None)
-        img_bytes = buffered.getvalue()
+        # PNG with compress_level=1: fast compression, lossless quality
+        # Level 9 saves ~5% size but takes 10x longer — not worth it for invoices
+        pil_image.save(buffered, format='PNG', compress_level=1)
+        img_bytes  = buffered.getvalue()
         img_base64 = base64.b64encode(img_bytes).decode('utf-8')
-        
-        # Log size
+
         size_mb = len(img_bytes) / (1024 * 1024)
-        print(f"📦 Image encoded: {size_mb:.2f}MB as {format}")
-        
-        return f"data:image/{format.lower()};base64,{img_base64}"
+        print(f"📦 Image encoded: {size_mb:.2f} MB as lossless PNG ({pil_image.width}x{pil_image.height})")
+
+        return f"data:image/png;base64,{img_base64}"
     
     @traceable(name="model_extract_invoice", tags=["model", "extraction"], metadata={"model": "qwen3.7-plus"})
     def extract_invoice(
@@ -130,8 +136,8 @@ class OpenRouterClient:
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0.1,
-        max_tokens: int = 2500,
-        use_reasoning: bool = False   # OFF by default — reasoning burns tokens and hallucinates on extraction tasks
+        max_tokens: int = 16000,
+        use_reasoning: bool = True    # ON by default — reasoning critical for character-level accuracy
     ) -> tuple[dict, dict]:
         """
         Extract invoice data using vision model.
@@ -174,15 +180,16 @@ class OpenRouterClient:
             'temperature': temperature,
             'max_tokens': max_tokens,
             # ── Reasoning / thinking control ────────────────────────────
-            # Reasoning is enabled (effort=medium) for item code accuracy.
-            # CRITICAL: exclude=True keeps reasoning tokens in the thinking
-            # buffer and does NOT count them against max_tokens.
-            # For cheap classification calls, use_reasoning=False to avoid
-            # the model spending any tokens on chain-of-thought.
+            # reasoning effort=high: model thinks through every ambiguous character
+            # before committing to a value (batch numbers, GSTINs, item codes).
+            # CRITICAL: exclude=True keeps reasoning tokens in the thinking buffer
+            # and does NOT count them against max_tokens — output budget is preserved.
+            # For cheap classification calls, use_reasoning=False disables thinking
+            # entirely (effort=none) to avoid unnecessary token spend.
             **(
                 {
-                    'reasoning': {'effort': 'medium', 'exclude': True},
-                    'reasoning_effort': 'medium',
+                    'reasoning': {'effort': 'high', 'exclude': True},
+                    'reasoning_effort': 'high',
                     'thinking': {'type': 'enabled'},
                     'enable_thinking': True,
                 }
@@ -303,7 +310,7 @@ class OpenRouterClient:
                     if not reasoning_text and use_reasoning:
                         print(f"⚠️  content=None with exclude=True — retrying with exclude=False to recover reasoning")
                         payload_retry = dict(payload)
-                        payload_retry['reasoning'] = {'effort': 'medium', 'exclude': False}
+                        payload_retry['reasoning'] = {'effort': 'high', 'exclude': False}
                         try:
                             retry_resp = requests.post(self.base_url, headers=headers, json=payload_retry, timeout=timeout_duration)
                             if retry_resp.status_code == 200:
@@ -508,7 +515,7 @@ class OpenRouterClient:
             header_system,
             header_user,
             temperature=temperature,
-            max_tokens=2000  # Header: ~15 fields; 2000 ensures room even with reasoning
+            max_tokens=4000   # Header: 12 fields; 4000 gives full reasoning headroom
         )
         
         if 'error' in header_data:
@@ -534,7 +541,7 @@ class OpenRouterClient:
             totals_system,
             totals_user,
             temperature=temperature,
-            max_tokens=3000  # Totals: reasoning can consume ~1500 tokens, need 3000 total
+            max_tokens=6000   # Totals: reasoning on amounts/rates needs space
         )
         
         if 'error' in totals_data:
@@ -566,8 +573,8 @@ class OpenRouterClient:
             items_system,
             items_user_with_context,
             temperature=temperature,
-            max_tokens=8000  # 8000 keeps full items array safe: 10 items ≈ 1500-2000 tokens output,
-                             # reasoning excluded from budget via exclude=True in payload
+            max_tokens=16000  # Items pass: each item ~150-200 tokens; 16000 covers 60+ items
+                              # reasoning excluded via exclude=True — full budget for JSON output
         )
         
         if 'error' in items_data:
@@ -837,7 +844,7 @@ class OpenRouterClient:
 
         header_data, header_response = self.extract_invoice(
             page_1, header_system, header_user,
-            temperature=temperature, max_tokens=2000
+            temperature=temperature, max_tokens=4000
         )
         if 'error' in header_data:
             return {

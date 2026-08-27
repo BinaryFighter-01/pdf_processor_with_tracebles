@@ -225,10 +225,12 @@ def extract_invoice():
             processed_image, preprocess_debug = preprocessor.process(
                 image,
                 do_orient=True if idx == 0 else False,  # Only detect orientation on first page
-                do_deskew=False,
-                do_enhance=True,
-                do_denoise=False,
-                do_sharpen=False
+                do_deskew=True,      # ✅ ENABLED — corrects tilted scans
+                do_enhance=True,     # ✅ already ON — contrast enhancement
+                do_denoise=False,    # OFF — too slow, blurs text
+                do_sharpen=True,     # ✅ ENABLED — sharpens text edges
+                do_crop_border=True, # ✅ ENABLED — removes scanner margins
+                do_binarize=False    # OFF unless invoice is genuinely faded
             )
             
             # Log orientation details only for first page
@@ -425,16 +427,11 @@ def extract_invoice():
         # ═══════════════════════════════════════════════════════════
         log_step("Enriching GST fields (comprehensive)...")
         
-        try:
-            # New comprehensive GST enrichment
-            extracted_data = enrich_gst_comprehensive(extracted_data)
-            log_step("✅ GST enrichment complete")
-        except Exception as gst_enrich_error:
-            log_step(f"⚠️  GST enrichment error: {str(gst_enrich_error)}")
-        
         # ═══════════════════════════════════════════════════════════
         # FREE ITEM SPLITTING
         # ═══════════════════════════════════════════════════════════
+        # CRITICAL: Split items BEFORE any GST calculations.
+        # GST enrichment must work on correct paid-only quantities, not pre-split.
         log_step("Splitting free items into separate records...")
         
         try:
@@ -456,20 +453,28 @@ def extract_invoice():
             
             # Get stats after splitting
             stats = get_free_item_stats(extracted_data)
-            items_after = stats['total_items']
-            
-            if stats['has_free_items']:
-                log_step(f"✅ Free items split: {items_before} items → {items_after} items "
-                        f"({stats['paid_items']} paid + {stats['free_items']} free)")
-            else:
-                log_step(f"✅ No free items found ({items_after} total items)")
-            
-            # ═══════════════════════════════════════════════════════════
-            # CALCULATE TOTAL_QUANTITY (PAID ITEMS ONLY)
-            # ═══════════════════════════════════════════════════════════
-            # Business rule: total_quantity = sum of PAID quantities only.
-            # Free items (free_item_yn == "1") are excluded.
-            log_step("Calculating total_quantity (paid items only)...")
+            log_step(f"✅ Free items split: {stats['total_items_before']} items → {stats['total_items_after']} items ({stats['paid_items']} paid, {stats['free_items']} free)")
+        except Exception as split_error:
+            log_step(f"⚠️  Free item splitting error: {str(split_error)}")
+        
+        # ═══════════════════════════════════════════════════════════
+        # GST ENRICHMENT (AFTER SPLITTING)
+        # ═══════════════════════════════════════════════════════════
+        log_step("Enriching GST fields...")
+        try:
+            # New comprehensive GST enrichment
+            # NOW runs AFTER splitting — calculates on correct paid-only quantities
+            extracted_data = enrich_gst_comprehensive(extracted_data)
+            log_step("✅ GST enrichment complete")
+        except Exception as gst_enrich_error:
+            log_step(f"⚠️  GST enrichment error: {str(gst_enrich_error)}")
+        
+        # ═══════════════════════════════════════════════════════════
+        # CALCULATE TOTAL_QUANTITY (PAID ITEMS ONLY)
+        # ═══════════════════════════════════════════════════════════
+        # Business rule: total_quantity = sum of PAID quantities only.
+        # Free items (free_item_yn == "1") are excluded.
+        log_step("Calculating total_quantity (paid items only)...")
             
             paid_quantity_sum = 0
             free_quantity_sum = 0

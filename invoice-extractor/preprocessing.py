@@ -228,6 +228,94 @@ class ImagePreprocessor:
         return Image.fromarray(denoised)
     
     @staticmethod
+    def crop_border(pil_img: Image.Image, threshold: int = 240, min_crop: int = 10) -> Image.Image:
+        """
+        Crop uniform-colored border regions (scanner margins, shadows).
+        
+        Finds content by locating where pixels differ significantly from the
+        dominant edge color. Handles both white borders (scanned documents)
+        and black borders (photo backgrounds).
+        
+        Args:
+            pil_img: Input PIL Image
+            threshold: Grayscale brightness cutoff (>240 = white border, <15 = black border)
+            min_crop: Minimum pixels to crop (prevents false crop on borderless images)
+        
+        Returns:
+            Cropped PIL Image with borders removed
+        """
+        img_np = np.array(pil_img.convert('RGB'))
+        gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+        h, w = gray.shape
+        
+        # Sample edge pixels to detect dominant border color
+        edge_pixels = np.concatenate([
+            gray[0, :],       # top row
+            gray[-1, :],      # bottom row
+            gray[:, 0],       # left column
+            gray[:, -1]       # right column
+        ])
+        edge_median = np.median(edge_pixels)
+        
+        # Detect border type: white (>240) or black (<15)
+        if edge_median > threshold:
+            # White border: find dark content pixels
+            mask = gray < threshold
+        else:
+            # Black border: find bright content pixels
+            mask = gray > 15
+        
+        # Find content bounding box
+        rows = np.any(mask, axis=1)
+        cols = np.any(mask, axis=0)
+        
+        if not rows.any() or not cols.any():
+            # No detectable border or fully uniform image — return unchanged
+            return pil_img
+        
+        y_min, y_max = np.where(rows)[0][[0, -1]]
+        x_min, x_max = np.where(cols)[0][[0, -1]]
+        
+        # Only crop if border is significant (prevents false crops)
+        crop_top    = y_min if y_min >= min_crop else 0
+        crop_bottom = y_max + 1 if (h - y_max) >= min_crop else h
+        crop_left   = x_min if x_min >= min_crop else 0
+        crop_right  = x_max + 1 if (w - x_max) >= min_crop else w
+        
+        cropped = img_np[crop_top:crop_bottom, crop_left:crop_right]
+        return Image.fromarray(cropped)
+
+    @staticmethod
+    def binarize(pil_img: Image.Image) -> Image.Image:
+        """
+        Adaptive thresholding for low-contrast invoices.
+        
+        Converts the image to black text on white background using local
+        threshold adaptation. Useful for faded thermal prints, photocopies,
+        or poorly lit scans where text is washed out.
+        
+        Returns:
+            PIL Image (converted back from binary for pipeline compatibility)
+        """
+        img_np = np.array(pil_img.convert('RGB'))
+        gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+        
+        # Adaptive thresholding: computes local threshold for each 11×11 block
+        # GAUSSIAN: weighs nearby pixels more (smoother than MEAN)
+        # C=2: subtract constant from mean to bias toward text (higher C = more aggressive)
+        binary = cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            blockSize=11,
+            C=2
+        )
+        
+        # Convert back to RGB for downstream compatibility
+        rgb = cv2.cvtColor(binary, cv2.COLOR_GRAY2RGB)
+        return Image.fromarray(rgb)
+
+    @staticmethod
     def sharpen(pil_img: Image.Image) -> Image.Image:
         """Sharpen image for better text clarity."""
         img_np = np.array(pil_img.convert('RGB'))
@@ -248,10 +336,22 @@ class ImagePreprocessor:
         do_deskew: bool = True,
         do_enhance: bool = True,
         do_denoise: bool = False,
-        do_sharpen: bool = True
+        do_sharpen: bool = True,
+        do_crop_border: bool = True,
+        do_binarize: bool = False
     ) -> tuple[Image.Image, dict]:
         """
         Complete preprocessing pipeline.
+        
+        Args:
+            pil_img: Input PIL Image
+            do_orient: Correct 0/90/180/270° rotation (via OCR or heuristic)
+            do_deskew: Correct sub-degree skew via Hough transform (recommended ON)
+            do_enhance: CLAHE contrast enhancement on LAB L-channel (recommended ON)
+            do_denoise: Apply color-preserving denoising (slow, use only for noisy scans)
+            do_sharpen: Apply 3x3 sharpening kernel (recommended ON)
+            do_crop_border: Remove scanner margins/shadows (recommended ON)
+            do_binarize: Adaptive thresholding for poor-contrast invoices (use if text is washed out)
         
         Returns:
             Tuple of (processed_image, debug_info)
@@ -262,6 +362,11 @@ class ImagePreprocessor:
         }
         
         processed = pil_img
+        
+        # Step 0: Remove scanner borders/shadows
+        if do_crop_border:
+            processed = self.crop_border(processed)
+            debug_info['steps_applied'].append('Border cropping')
         
         # Step 1: Orientation correction
         if do_orient:
@@ -292,6 +397,11 @@ class ImagePreprocessor:
         if do_sharpen:
             processed = self.sharpen(processed)
             debug_info['steps_applied'].append('Sharpening')
+        
+        # Step 6: Binarization (optional)
+        if do_binarize:
+            processed = self.binarize(processed)
+            debug_info['steps_applied'].append('Binarization')
         
         debug_info['final_size'] = processed.size
         
