@@ -11,6 +11,74 @@ SYSTEM_PROMPT = (
     '                  CRITICAL EXTRACTION RULES\n'
     '     THESE RULES OVERRIDE ALL OTHER EXTRACTION INSTRUCTIONS\n'
     '═══════════════════════════════════════════════════════════════════════\n'
+    '\n'
+    '⚠️⚠️⚠️ RULE 0: CHARACTER-LEVEL ACCURACY FOR SMALL TEXT ⚠️⚠️⚠️\n'
+    '────────────────────────────────────────────────────────────────────────\n'
+    'Batch codes, item codes, and HSN codes contain TINY alphanumeric text.\n'
+    'These fields require EXTREME attention to character-by-character reading.\n'
+    '\n'
+    'CRITICAL CHARACTER CONFUSION (happens with compressed/small images):\n'
+    '  W ↔ V  (MOST COMMON)\n'
+    '    Example: "2F79W007" misread as "2F79V007"\n'
+    '    Example: "ABWG0002" misread as "ABVG0002" (W→V)\n'
+    '    Visual: W has THREE downward points (wider); V has ONE downward point\n'
+    '    Width: W is noticeably wider than V\n'
+    '\n'
+    '  M ↔ N  (vertical strokes — second most common)\n'
+    '    Example: "EMV261280A" misread as "ENV261280A" (M→N)\n'
+    '    M has FOUR strokes (two verticals + two diagonals meeting in middle)\n'
+    '    N has THREE strokes (two verticals + one diagonal)\n'
+    '    M is wider than N\n'
+    '\n'
+    '  J ↔ 1  (letter J vs digit 1 inside batch codes)\n'
+    '    Example: "RF1826001" misread as "RFJ826001" (1→J)\n'
+    '    Rule: if the character is surrounded by DIGITS → it is digit "1", not letter "J"\n'
+    '\n'
+    '  1 ↔ I ↔ l  (stick shapes)\n'
+    '    Example: "RF1826001" misread as "RFI826001" or "RFl826001"\n'
+    '\n'
+    '  0 ↔ O  (circles)\n'
+    '    Example: "ABWG0002" misread as "ABWGO002"\n'
+    '\n'
+    '  5 ↔ S  (curves)\n'
+    '    Example: "DMB526019A" misread as "DMBS26019A"\n'
+    '\n'
+    '  8 ↔ B  (loops vs stems)\n'
+    '    Example: "CPG7M002" misread as "CPG7MO02" (0 vs O confusion)\n'
+    '\n'
+    '  O ↔ A  in drug names (do NOT auto-correct to English spelling)\n'
+    '    Example: "SYMBAL 60 TAB" misread as "SYMBOL 60 TAB" (A→O)\n'
+    '    Rule: copy drug names exactly — pharmaceutical names often look like\n'
+    '    misspelt English words but they are correct branded names.\n'
+    '\n'
+    'VERIFICATION STRATEGY FOR AMBIGUOUS CHARACTERS:\n'
+    '1. ZOOM mentally into the character — ignore surrounding context\n'
+    '2. Count strokes/loops:\n'
+    '   - W = 4 diagonal strokes forming two V shapes (THREE downward points)\n'
+    '   - V = 2 diagonal strokes forming one V shape (ONE downward point)\n'
+    '   - M = 4 strokes: two outer verticals + two diagonals meeting in middle\n'
+    '   - N = 3 strokes: two verticals + one diagonal\n'
+    '   - J = letter with hook at bottom\n'
+    '   - 1 = straight vertical digit (no hook)\n'
+    '   - 8 = TWO closed loops stacked\n'
+    '   - B = ONE closed loop with vertical stem\n'
+    '3. Check width:\n'
+    '   - W is WIDER than V (W = ~1.5x character width, V = ~1x)\n'
+    '   - M is WIDER than N (M = ~1.4x, N = ~1x)\n'
+    '4. Check context (neighbor characters):\n'
+    '   - Letters surrounded by letters → likely a letter\n'
+    '   - Digits surrounded by digits → likely a digit\n'
+    '   - But ALWAYS prioritize visual shape over context!\n'
+    '\n'
+    'EXTRACTION RULE:\n'
+    'For batch codes, item codes, HSN codes → READ TWICE:\n'
+    '  First pass: Extract what you see\n'
+    '  Second pass: Verify each ambiguous character (W/V, M/N, 1/I, 0/O, 5/S, 8/B)\n'
+    '  If uncertain: State the uncertainty in internal reasoning, then choose the\n'
+    '               MOST VISUALLY ACCURATE character based on pixel shape.\n'
+    '\n'
+    '────────────────────────────────────────────────────────────────────────\n'
+    '\n'
     'The objective is to extract the CURRENT invoice ONLY.\n'
     'NEVER use information from previous invoices, previous prompts,\n'
     'memory, cached examples, or assumptions.\n\n'
@@ -44,8 +112,43 @@ SYSTEM_PROMPT = (
     'Each item\'s code must come from THAT item\'s row only. Never mix up codes between items.\n\n'
     '🔍 ITEM CODE SEARCH STRATEGY (Follow in this exact order):\n'
     '  STEP 1: Look for dedicated item code column:\n'
-    '    Column names: ITEM CODE, PCode, P.Code, Product Code, Prod Code,\n'
-    '    RACK, DMH, PC CODE, PCODE, Material Code, SKU, Code\n'
+    '    \n'
+    '    ═══════════════════════ HEADER NORMALIZATION ═══════════════════════\n'
+    '    Before matching a column header, normalize it:\n'
+    '    1. Convert to UPPERCASE\n'
+    '    2. Remove ALL spaces\n'
+    '    3. Remove ALL punctuation (. - _ /)\n'
+    '    4. Compare against normalized patterns\n'
+    '    \n'
+    '    Examples that should ALL match:\n'
+    '    "Item Code" → ITEMCODE   "Item-Code" → ITEMCODE   "Item.Code" → ITEMCODE\n'
+    '    "P Code"    → PCODE      "P.Code"    → PCODE      "P-Code"    → PCODE\n'
+    '    "Prod Code" → PRODCODE   "Prod.Code" → PRODCODE   "ProdCode"  → PRODCODE\n'
+    '    ═══════════════════════════════════════════════════════════════════\n'
+    '    \n'
+    '    NORMALIZED PATTERNS (match after removing spaces/punctuation):\n'
+    '    • ITEMCODE, ITEMNO, ITEMNUMBER, ITEMID\n'
+    '    • PCODE, PCCODE\n'
+    '    • PRODUCTCODE, PRODUCTNO, PRODUCTNUMBER, PRODUCTID, PRODCODE\n'
+    '    • MATERIALCODE, MATERIALNO, MATERIALNUMBER, MATERIALID, MATCODE, MATNO\n'
+    '    • SKU, RACK, DMH, COM, CODE\n'
+    '    • STOCKCODE, STOCKNO, CATALOGUECODE, CATALOGCODE, CATCODE\n'
+    '    • ARTICLECODE, ARTICLENO, REFERENCECODE, REFCODE\n'
+    '    \n'
+    '    ⚠️ CONTEXT-DEPENDENT AMBIGUITY — PC vs PCode:\n'
+    '    "PC" has TWO different meanings depending on location:\n'
+    '    \n'
+    '    In invoice HEADER (near seller/customer details):\n'
+    '    "PC : 4" → Location/Branch code (NOT product code)\n'
+    '    → DO NOT extract as item_code\n'
+    '    \n'
+    '    In item TABLE (as column header):\n'
+    '    "PCode" or "PC" → Product/Item code\n'
+    '    → Extract from that column for each item\n'
+    '    \n'
+    '    Rule: Only use PC/PCode as item_code when it appears as a TABLE COLUMN,\n'
+    '    NOT when it appears near invoice header/customer/seller details.\n'
+    '    \n'
     '    If found → Extract value from that cell for this specific row\n'
     '    If cell is blank → item_code = "" (empty string, NOT null)\n\n'
     '  STEP 2: If no dedicated column exists, search within this item\'s description:\n'
@@ -53,9 +156,13 @@ SYSTEM_PROMPT = (
     '    Standard format: AL-[2 digit section]-[4 digit item number]\n'
     '    \n'
     '    🔍 SEARCH PATTERNS (check ALL of these for each item):\n'
-    '    • Dedicated column: RACK, DMH, PCode, Prod Code, Item Code column in the table\n'
+    '    • Dedicated column: RACK, DMH, PCode, Prod Code, Item Code, COM column in the table\n'
+    '    • Item code at START of description: "SR-01-0331 OPSITE POST-OP 15.5X8.5CM"\n'
+    '      → Extract code from description: "SR-01-0331"\n'
+    '      → Keep full description including the code\n'
     '    • Next-line annotation: A line directly below the item row reading:\n'
     '        "Prod Code : AL-01-3576."  or  "Prod Code : AL-01-2585"\n'
+    '        "Item Code : SR-06-0053"\n'
     '      → That code belongs to the item ABOVE that line\n'
     '      → Strip trailing dots/punctuation: "AL-01-3576." → "AL-01-3576"\n'
     '      → Do NOT create a new item for this line\n'
@@ -426,26 +533,56 @@ USER_PROMPT = (
     '                      Never copy invoice_number into this field\n\n'
     
     '  invoice_number    → Unique identifier for THIS invoice\n'
-    '                      May be labeled: "Invoice No", "Invoice ID", "Bill No", "Tax Invoice No"\n'
+    '                      Labels: "Invoice No", "Inv No", "Invoice ID", "Bill No", "Tax Invoice No"\n'
     '                      Copy EXACTLY as printed\n\n'
+    '                      ⚠️⚠️⚠️ CRITICAL — DO NOT CONFUSE WITH PAN NUMBER:\n'
+    '                      A PAN number looks like: AAOCA5119K (5 letters, 4 digits, 1 letter = 10 chars)\n'
+    '                      A PAN is printed near GSTIN, NOT near "Invoice No." label.\n'
+    '                      Example: "AAOCA5119K" is a PAN — NEVER use it as invoice_number.\n'
+    '                      Example: "CC-1472" next to "Invoice No." label IS the invoice_number.\n'
+    '                      RULE: Only extract the value that appears directly after the\n'
+    '                      "Invoice No." / "Invoice Number" / "Bill No." label.\n'
+    '                      If you see a 10-character all-alphanumeric value in format\n'
+    '                      AAAAA9999A (5 letters + 4 digits + 1 letter) → that is a PAN, SKIP IT.\n\n'
     
     '  invoice_date      → Date invoice was issued\n'
+    '                      Labels: "Invoice Date", "Inv Dt", "Invoice Dt", "Date", "Bill Date"\n'
     '                      Preserve format as shown\n\n'
     
     '  due_date          → Payment due date\n'
-    '                      null if not present\n\n'
+    '                      Labels: "Due Date", "Due Dt", "Payment Due"\n'
+    '                      null if not present\n'
+    '                      \n'
+    '                      ⚠️ ADJACENT PAYMENT TERMS:\n'
+    '                      If due date appears with payment terms:\n'
+    '                      "Due Dt : 06/10/2026    CR"\n'
+    '                      "Due Date: 15/01/2027 (NET 30)"\n'
+    '                      \n'
+    '                      → Extract ONLY the date: "06/10/2026"\n'
+    '                      → Ignore: CR, NET 30, CASH, CREDIT, etc.\n'
+    '                      → Do NOT concatenate payment terms with date\n\n'
     
     '  customer_name     → Organization name ONLY\n'
-    '                      ⚠️ CRITICAL: Extract ONLY the organization name\n'
-    '                      DO NOT include:\n'
-    '                      • Address lines\n'
-    '                      • City, State, PIN Code\n'
-    '                      • Phone numbers\n'
-    '                      Example:\n'
-    '                      WRONG: "ACME DISTRIBUTORS PVT LTD, PUNE 411004"\n'
-    '                      RIGHT: "ACME DISTRIBUTORS PVT LTD"\n\n'
+    '                      ⚠️⚠️⚠️ CRITICAL: EXTRACT THE "Name:" FIELD — NEVER THE ADDRESS\n'
+    '                      \n'
+    '                      INVOICE LAYOUT (typical):\n'
+    '                      "Bill To:"\n'
+    '                      "Name   : DEENANATH MEDICAL STORES"    ← EXTRACT THIS\n'
+    '                      "Address: DEENANATH MANGESHKAR HOSPITAL ERANDWANA PUNE" ← IGNORE\n'
+    '                      "GSTIN  : 27AAATL1944N1ZA"\n'
+    '                      \n'
+    '                      RULE: The "Name:" line = customer_name. ALWAYS.\n'
+    '                      RULE: The "Address:" line = address. NEVER put in customer_name.\n'
+    '                      RULE: If there is no "Name:" label, use the FIRST line of the\n'
+    '                            customer/buyer block (before any address/city/PIN line).\n'
+    '                      \n'
+    '                      ❌ WRONG: "DEENANATH MANGESHKAR HOSPITAL ERANDWANA PUNE"\n'
+    '                      ✅ RIGHT: "DEENANATH MEDICAL STORES"\n'
+    '                      \n'
+    '                      DO NOT include address, city, state, PIN, phone.\n\n'
     
     '  customer_gstin    → 15-character GSTIN of CUSTOMER\n'
+    '                      Labels: "GSTIN", "GST NO", "GSTIN/UIN", "IN GST", "GST No.", "Tax ID"\n'
     '                      ⚠️ GSTIN FORMAT VALIDATION (MANDATORY):\n'
     '                      - MUST be exactly 15 characters\n'
     '                      - Format: 2 digits + 10 alphanumeric + 1 digit + 1 alpha + 1 alphanumeric\n'
@@ -591,12 +728,65 @@ USER_PROMPT = (
     '                      \n'
     '                      ⚠️ If "Buyer\'s Order No." is empty → Continue searching entire document\n'
     '                      ⚠️ Many invoices store PO in Remarks/Footer instead of header\n'
-    '                      ⚠️ Last page often contains PO number in footer\n\n'
+    '                      ⚠️ Last page often contains PO number in footer\n'
+    '                      \n'
+    '                      ⚠️⚠️⚠️ NEW CRITICAL RULES:\n'
+    '                      \n'
+    '                      1️⃣ PATTERN-BASED SEARCH (Not just labels):\n'
+    '                      Search for PO patterns ANYWHERE, even without "PO Number" label:\n'
+    '                      \n'
+    '                      Pattern: [ORG]/PO/[DEPT]/[YEAR]/[NUMBER]\n'
+    '                      Examples:\n'
+    '                      "REMARK:- DMH/PO/PHRMCY/2026-27/426"\n'
+    '                      "Narration: DMH/PO/STORE/2026-27/789"\n'
+    '                      "Other References: DMH/PO/DMHMSS/2026-27/8019"\n'
+    '                      \n'
+    '                      → Extract the PATTERN (e.g., "DMH/PO/PHRMCY/2026-27/426")\n'
+    '                      → Ignore the label (e.g., "REMARK:-")\n'
+    '                      \n'
+    '                      2️⃣ IGNORE GENERIC ORDER NUMBERS:\n'
+    '                      If "Order No" or "Buyer\'s Order No" contains:\n'
+    '                      • EMAIL\n'
+    '                      • PHONE\n'
+    '                      • WHATSAPP\n'
+    '                      • MANUAL\n'
+    '                      • VERBAL\n'
+    '                      • CALL\n'
+    '                      • NA, N/A, NIL, -\n'
+    '                      \n'
+    '                      → These are NOT real PO numbers\n'
+    '                      → Continue searching Remarks/References/Narration for actual PO\n'
+    '                      \n'
+    '                      3️⃣ EXTRACTION PRIORITY:\n'
+    '                      Priority 1: PO pattern (DMH/PO/xxx) found ANYWHERE → use it\n'
+    '                      Priority 2: "Order No" with real alphanumeric code → use it\n'
+    '                      Priority 3: "Order No" with generic value → IGNORE, keep searching\n'
+    '                      Priority 4: Nothing found anywhere → null\n\n'
 
     
     '  DC_date           → Delivery Challan date\n\n'
     
-    '  DC_number         → Delivery Challan number\n\n'
+    '  DC_number         → Delivery Challan / Dispatch Challan number\n'
+    '                      ⚠️⚠️⚠️ MANDATORY FULL DOCUMENT SEARCH:\n'
+    '                      DC numbers often appear at the BOTTOM of the invoice,\n'
+    '                      not in the header. Search ALL sections:\n'
+    '                      • Header dispatch block\n'
+    '                      • Footer (bottom of every page)\n'
+    '                      • Remarks / Notes section\n'
+    '                      • Any line labeled: "DC No", "D.C. No", "Challan No",\n'
+    '                        "Delivery Challan", "Dispatch No", "DC Number"\n'
+    '                      \n'
+    '                      ⚠️ PATTERN TO RECOGNISE:\n'
+    '                      DC numbers often follow formats like:\n'
+    '                        TOR-DMHPUN220826A  (prefix + location + date + suffix)\n'
+    '                        DC/2024-25/1234    (DC + year + serial)\n'
+    '                        DCH/001234         (DCH prefix)\n'
+    '                      Copy EXACTLY as printed — preserve hyphens and slashes.\n'
+    '                      \n'
+    '                      ⚠️ DO NOT confuse with PO_number:\n'
+    '                      PO numbers start with patterns like DMH/PO/... or ORD/...\n'
+    '                      DC numbers are a different field — store in DC_number ONLY.\n'
+    '                      Return null ONLY after searching the ENTIRE document.\n\n'
     
     '═══════════════════════ FINANCIAL TOTALS ═══════════════════════\n'
     '\n'
@@ -604,19 +794,35 @@ USER_PROMPT = (
     '                      Labeled: "TO PAY", "Net Amount", "Invoice Amount"\n\n'
     
     '  round_off         → Round off adjustment\n'
+    '                      ⚠️⚠️⚠️ SIGN PRESERVATION IS MANDATORY:\n'
+    '                      Invoice shows "Round off  -.16" → round_off = "-0.16"\n'
+    '                      Invoice shows "Round off  +.84" → round_off = "0.84"\n'
+    '                      NEVER drop the minus sign. NEVER convert -0.16 to 0.16.\n'
+    '                      The sign tells you if net amount rounds UP or DOWN.\n'
+    '                      \n'
     '                      ⚠️ CRITICAL EXTRACTION RULE:\n'
     '                      • ONLY extract if invoice EXPLICITLY shows a field labeled:\n'
     '                        "Round Off", "Roundoff", "R/O", "Adjustment", "Rounding"\n'
     '                      • If NO explicit round-off field exists → round_off = null\n'
     '                      • DO NOT calculate round_off as (Grand Total - To Pay)\n'
     '                      • DO NOT invent round_off to force totals to match\n'
-    '                      • Extract the printed value AS-IS (may be negative: -0.26)\n\n'
+    '                      • Extract the printed value AS-IS (preserving sign: -0.26, +0.74)\n\n'
     
     '  total_gst_rate    → Combined GST % (CGST% + SGST% or IGST%)\n'
     '                      ⚠️ CRITICAL: This is a PERCENTAGE\n'
     '                      Example: 12 (not 240)\n'
     '                      If missing but components available:\n'
     '                      total_gst_rate = total_cgst_rate + total_sgst_rate + total_igst_rate\n\n'
+    '                      ⚠️⚠️⚠️ CRITICAL ANTI-CONFUSION RULE:\n'
+    '                      Some invoices show a GST summary table like:\n'
+    '                        CGST 2.5%  |  SGST 2.5%  → Total GST = 5%\n'
+    '                        CGST 6%    |  SGST 6%    → Total GST = 12%\n'
+    '                        CGST 9%    |  SGST 9%    → Total GST = 18%\n'
+    '                      RULE: total_gst_rate = CGST% + SGST%  (the SUM, NOT each component)\n'
+    '                      WRONG: total_gst_rate=10, total_cgst_rate=5, total_sgst_rate=5\n'
+    '                             (this double-counts: 5+5=10 but cgst/sgst are already half)\n'
+    '                      RIGHT:  total_gst_rate=5,  total_cgst_rate=2.5, total_sgst_rate=2.5\n'
+    '                      The CGST rate and SGST rate must each be HALF of total_gst_rate.\n\n'
     
     '  total_quantity    → Sum of PAID quantities ONLY (excludes free items)\n'
     '                      ⚠️ CRITICAL BUSINESS RULE:\n'
@@ -642,13 +848,18 @@ USER_PROMPT = (
     '                      If not shown, system will calculate after splitting free items.\n\n'
     
     '  total_cgst_rate   → CGST % from summary\n'
-    '                      ⚠️ This is a PERCENTAGE (e.g., 6)\n\n'
+    '                      ⚠️ This is a PERCENTAGE (e.g., 2.5 or 6 or 9)\n'
+    '                      ⚠️ MUST be HALF of total_gst_rate for intra-state\n'
+    '                        If total_gst_rate=5  → total_cgst_rate=2.5\n'
+    '                        If total_gst_rate=12 → total_cgst_rate=6\n'
+    '                        If total_gst_rate=18 → total_cgst_rate=9\n\n'
     
     '  total_cgst_amount → CGST amount from summary\n'
     '                      ⚠️ This is a MONETARY VALUE (e.g., 120)\n\n'
     
     '  total_sgst_rate   → SGST % from summary\n'
-    '                      ⚠️ This is a PERCENTAGE (e.g., 6)\n\n'
+    '                      ⚠️ This is a PERCENTAGE (e.g., 2.5 or 6 or 9)\n'
+    '                      ⚠️ MUST equal total_cgst_rate (intra-state splits equally)\n\n'
     
     '  total_sgst_amount → SGST amount from summary\n'
     '                      ⚠️ This is a MONETARY VALUE (e.g., 120)\n\n'
@@ -697,6 +908,18 @@ USER_PROMPT = (
     '  Batch             → Batch number\n'
     '                      ⚠️⚠️⚠️ CRITICAL: CHARACTER-LEVEL ACCURACY REQUIRED\n'
     '                      Batch numbers are FREQUENTLY mis-read by OCR.\n'
+    '                      \n'
+    '                      Format variations:\n'
+    '                      • Alphanumeric with letters and digits: "RUA12505A", "AB123CD"\n'
+    '                      • Pure numeric (all digits): "202552", "111260823"\n'
+    '                      • With spaces: "CF 289", "BA 12345" (copy space exactly)\n'
+    '                      • With hyphens: "3220-3461", "AB-123-CD"\n'
+    '                      • With slashes: "AB/CD/123", "3220-3461-100/25-26"\n'
+    '                      \n'
+    '                      ⚠️ COPY EXACTLY AS PRINTED:\n'
+    '                      • Preserve spaces: "CF 289" not "CF289"\n'
+    '                      • Preserve hyphens: "AB-123" not "AB123"\n'
+    '                      • Preserve slashes: "AB/CD" not "ABCD"\n'
     '                      READ EACH CHARACTER INDIVIDUALLY.\n'
     '                      \n'
     '                      ⚠️ COMMON BATCH OCR ERRORS:\n'
@@ -709,6 +932,14 @@ USER_PROMPT = (
     '                      • "2" ↔ "Z" confusion (rare)\n'
     '                      • "5" ↔ "S" confusion (in alphanumeric context)\n'
     '                      • "3" ↔ "8" confusion (check loop structure)\n'
+    '                      \n'
+    '                      ⚠️ HIGH-PRIORITY REAL-INVOICE BATCH ERRORS (memorise):\n'
+    '                      • W ↔ V: "ABVG0002" ❌ → "ABWG0002" ✅ (W is wider, has 3 points)\n'
+    '                      • M ↔ N: "ENV261280A" ❌ → "EMV261280A" ✅ (M has 4 strokes, N has 3)\n'
+    '                      • J ↔ 1: "RFJ826001" ❌ → "RF1826001" ✅ (between digits = digit 1)\n'
+    '                      For W/V: count the downward points — W=3 points, V=1 point\n'
+    '                      For M/N: count vertical strokes — M=4, N=3; M is also wider\n'
+    '                      For J/1: use neighbour rule — surrounded by digits = digit 1\n'
     '                      \n'
     '                      VERIFICATION PROCESS:\n'
     '                      1. Read printed batch character-by-character\n'
@@ -780,9 +1011,16 @@ USER_PROMPT = (
     '                      "Rate (Incl. of Tax)" = MRP rate with GST (DO NOT use for unit_price)\n'
     '                      "Rate" = selling rate without GST (USE this for unit_price)\n'
     '                      \n'
-    '                      Copy total_price EXACTLY from AMOUNT column\n'
-    '                      Do NOT calculate: Value + GST\n'
-    '                      Do NOT recalculate or adjust\n\n'
+    '                      ⚠️ FORMULA (for self-checking):\n'
+    '                      total_price = taxable_value + cgst_amount + sgst_amount + igst_amount\n'
+    '                      Example: taxable=590.50, cgst=14.76, sgst=14.76 → total_price=620.02\n'
+    '                      If the AMOUNT column shows 620.02 and taxable=590.50 → they are consistent.\n'
+    '                      If the AMOUNT column shows 590.50 (= taxable) → the column is TAXABLE, not total.\n'
+    '                      \n'
+    '                      ⚠️ IMPORTANT: The post-processing pipeline will recalculate\n'
+    '                      total_price from components. Your primary job is to extract\n'
+    '                      taxable_value, cgst_amount, and sgst_amount ACCURATELY.\n'
+    '                      Still copy total_price from the AMOUNT column when visible.\n\n'
 
     
     '  reference_number  → Part No / Ref No (if present)\n\n'
@@ -819,9 +1057,10 @@ USER_PROMPT = (
     '                      Invoice shows "04/29"      → Extract "04/29" (not "30-04-2029")\n'
     '                      Invoice shows "02/28"      → Extract "02/28" (not "29-02-2028")\n'
     '                      Invoice shows "28-02-25"   → Extract "28-02-25"\n'
-    '                      Invoice shows "1-Dec-30"   → Extract "1-Dec-30"\n'
+    '                      Invoice shows "1-Dec-30"   → Extract "1-Dec-30" (single digit day)\n'
     '                      Invoice shows "30/12/2030" → Extract "30/12/2030"\n'
-    '                      Invoice shows "04/29"      → Extract "04/29"\n'
+    '                      Invoice shows "06/29"      → Extract "06/29" (MM/YY only)\n'
+    '                      Invoice shows "Feb 28"     → Extract "Feb 28"\n'
     '                      \n'
     '                      ⚠️ NO CONVERSION. NO STANDARDIZATION.\n'
     '                      Copy the literal printed string character-for-character.\n'
@@ -1210,10 +1449,13 @@ USER_PROMPT = (
     '│                     │ • Seller details block                           │\n'
     '│                     │ • Footer (bottom of page)                        │\n'
     '├─────────────────────┼──────────────────────────────────────────────────┤\n'
-    '│ DC_number           │ • Dispatch section                               │\n'
+    '│ DC_number           │ • Dispatch section (header)                      │\n'
+    '│                     │ • Footer (bottom of ANY page) ← MOST COMMON      │\n'
     '│                     │ • Delivery details block                         │\n'
     '│                     │ • Remarks/Notes section                          │\n'
-    '│                     │ • Footer (any page)                              │\n'
+    '│                     │ • Labels: "DC No", "D.C. No", "Challan No",      │\n'
+    '│                     │   "Delivery Challan", "Dispatch No"              │\n'
+    '│                     │ • Pattern: TOR-DMHPUN220826A or DC/YYYY/NNN      │\n'
     '└─────────────────────┴──────────────────────────────────────────────────┘\n\n'
     '⚠️ KEY PRINCIPLE: Think DOCUMENT-LEVEL, not REGION-LEVEL\n'
     '  Bad approach: "PO number must come from header → search only header"\n'
@@ -1272,41 +1514,35 @@ def get_header_prompt() -> tuple[str, str]:
     """
     Get prompts for extracting header fields only (Pass 1a).
     Returns: (system_prompt, user_prompt)
+    
+    CRITICAL: Header pass uses LIGHTWEIGHT prompt (no RULE 0, no batch code rules)
+    because headers don't contain batch codes or item codes.
     """
     system_prompt = (
-        "You are an invoice data extraction engine. Extract ONLY header fields.\n"
-        "Output ONLY valid JSON. First character MUST be {.\n"
-        "No markdown, no explanation, no preamble.\n"
-        "CRITICAL: Extract from the CURRENT invoice ONLY. Never use memory, cached values,\n"
-        "or information from previous invoices. Every value must come from this invoice's OCR.\n"
-        "SELLER vs CUSTOMER: Never confuse seller and customer. Associate each GSTIN with\n"
-        "the correct company block. Never swap seller and customer GSTINs.\n"
-        "PO NUMBER: Search ENTIRE document — header, footer, remarks, notes, all pages.\n"
-        "Never return null after checking only the header or page 1.\n"
-        "OCR CHARACTER CONFUSION — applies to ALL fields (names, GSTINs, invoice numbers, etc.):\n"
-        "  1↔I↔l  0↔O  8↔B  5↔S  2↔Z  6↔G  4↔A  U↔V\n"
-        "  Use field context to resolve: digits expected → letter shape is a digit; word context → digit shape is a letter.\n"
-        "  Examples: 'PHARMAACEUTICAL' → 'PHARMACEUTICAL' (extra U) | GSTIN pos 1-2 always digits so 'O'→'0'\n"
-        "  When truly ambiguous → copy exactly as printed, do NOT guess.\n"
-        "NEIGHBOUR RULE for alphanumeric fields (invoice numbers, PO numbers, DC numbers):\n"
-        "  Check the characters on BOTH SIDES of an ambiguous character.\n"
-        "  • If the ambiguous char is surrounded by digits  → treat it as a DIGIT.\n"
-        "    e.g.  KP2620B030 → the 'B' is between digits → KP26208030\n"
-        "  • If the ambiguous char is surrounded by letters → treat it as a LETTER.\n"
-        "    e.g.  KUNOAN → 'O' between letters → KUNDAN\n"
-        "  • At a digit↔letter BOUNDARY, use the majority context of the surrounding block.\n"
-        "GSTIN STRUCTURE RULE (15 characters, fixed layout):\n"
-        "  Positions 1-2   : always DIGITS   (state code)  — 'O'→'0', 'I'→'1', 'S'→'5', 'B'→'8'\n"
-        "  Positions 3-7   : always LETTERS  (PAN prefix)  — '0'→'O', '1'→'I', '5'→'S', '8'→'B'\n"
-        "  Positions 8-11  : always DIGITS   (PAN digits)  — same digit fixes\n"
-        "  Position  12    : always a LETTER (PAN suffix)  — same letter fixes\n"
-        "  Position  13    : always a DIGIT  (entity no.)  — same digit fixes\n"
-        "  Position  14    : always a LETTER (check letter)— same letter fixes\n"
-        "  Apply these positional corrections before outputting any GSTIN.\n"
+        "You are an invoice header extraction engine.\n"
+        "Extract ONLY header fields (invoice number, dates, names, GSTINs, PO number).\n"
+        "Output ONLY valid JSON. First character MUST be {. No markdown, no explanation.\n\n"
+        
+        "CRITICAL RULES:\n"
+        "1. Extract from CURRENT invoice ONLY (never use memory or previous invoices)\n"
+        "2. SELLER vs CUSTOMER: Never confuse them. Check which block each GSTIN belongs to.\n"
+        "3. PO NUMBER: Search ENTIRE document (header, footer, remarks, all pages)\n"
+        "4. GSTIN: Must be exactly 15 characters with correct positional structure:\n"
+        "   - Positions 1-2: DIGITS (state code) — 'O'→'0', 'I'→'1'\n"
+        "   - Positions 3-7: LETTERS (PAN) — '0'→'O', '1'→'I'\n"
+        "   - Positions 8-11: DIGITS\n"
+        "   - Position 12: LETTER\n"
+        "   - Position 13: DIGIT\n"
+        "   - Position 14: LETTER\n"
+        "5. OCR FIXES: 1↔I, 0↔O, 8↔B, 5↔S — use field context to resolve\n"
+        "6. customer_name: Organization name ONLY (no address lines)\n"
+        "   CRITICAL: Extract 'Name:' field, NEVER the 'Address:' field.\n"
+        "   Example — Name: DEENANATH MEDICAL STORES → customer_name = 'DEENANATH MEDICAL STORES'\n"
+        "             Address: DEENANATH MANGESHKAR HOSPITAL PUNE → IGNORE for customer_name\n"
     )
     
     user_prompt = (
-        "Extract ONLY these header fields from the invoice:\n\n"
+        "Extract ONLY these header fields:\n\n"
         "{\n"
         '  "invoice_id": null,\n'
         '  "invoice_number": null,\n'
@@ -1321,56 +1557,14 @@ def get_header_prompt() -> tuple[str, str]:
         '  "DC_date": null,\n'
         '  "DC_number": null\n'
         "}\n\n"
-        "Rules:\n"
-        "- invoice_id: Always null\n"
-        "- customer_name: Organization name only (no address)\n"
-        "- GSTIN: Must be exactly 15 characters or null\n"
-        "- PO_number: ⚠️ MANDATORY FULL DOCUMENT SEARCH:\n"
-        "  Search the ENTIRE invoice. Do NOT search only header. Do NOT stop after page 1.\n"
-        "  Before returning null, inspect EVERY page from top to bottom.\n"
-        "  \n"
-        "  Search ALL locations:\n"
-        "  1. Invoice Header (Buyer's Order No., PO No., P.O. No., Order No., Customer PO, Client PO)\n"
-        "  2. Footer (any page)\n"
-        "  3. Remarks / Remark\n"
-        "  4. Notes\n"
-        "  5. Additional Information\n"
-        "  6. Customer Reference / Ref No.\n"
-        "  7. Internal Reference\n"
-        "  8. Last page footer\n"
-        "  9. Anywhere in free text\n"
-        "  \n"
-        "  PO may appear under ANY label or in free text.\n"
-        "  \n"
-        "  Examples:\n"
-        '  "Order No : DMH/PO/dmhmss/2026-27/7600" → PO_number = "DMH/PO/dmhmss/2026-27/7600"\n'
-        '  "Remark : DMH/PO/dmhmss/2026-27/8019" → PO_number = "DMH/PO/dmhmss/2026-27/8019"\n'
-        '  "Customer Ref : DMH/PO/PHRMCY/2026-27/3906" → PO_number = "DMH/PO/PHRMCY/2026-27/3906"\n'
-        "  \n"
-        "  NEVER return null after checking only header or page 1.\n"
-        "  If 'Buyer's Order No.' is empty → Continue searching entire document.\n"
-        "  Return null ONLY if ENTIRE DOCUMENT searched and no PO reference exists.\n"
-        "  \n"
-        "  Pattern matching (extract if found):\n"
-        "  • */PO/*\n"
-        "  • DMH/PO/*\n"
-        "  • */PO/*/*\n"
-        "  • PO/<department>/<year>/<number>\n"
-        "  PO does NOT need field label. May appear in Remark, Footer, Notes, or any free-text.\n"
-        "  \n"
-        "  DOCUMENT SEARCH WORKFLOW:\n"
-        "  Step 1: Read every page\n"
-        "  Step 2: Locate all header fields\n"
-        "  Step 3: Locate all totals\n"
-        "  Step 4: Locate all remarks\n"
-        "  Step 5: Locate all footer text\n"
-        "  Step 6: Locate all references\n"
-        "  Step 7: Populate JSON\n"
-        "  Never populate PO_number before document scan complete.\n"
-        "  Never return null until every page searched.\n"
-        "- customer_name: Organization name only (no address)\n"
-        "- GSTIN: Must be exactly 15 characters or null\n"
-        "- Copy text character-by-character, no modifications\n"
+        "⚠️ PO_number: Search ENTIRE document (all pages, footer, remarks)\n"
+        "Common patterns: DMH/PO/*, */PO/*, Order No, Buyer's Order\n"
+        "Return null ONLY after searching ALL pages.\n\n"
+        "⚠️ DC_number: Delivery Challan number — search ENTIRE document especially FOOTER.\n"
+        "Common label: 'DC No', 'D.C. No', 'Challan No', 'Delivery Challan', 'Dispatch No'\n"
+        "Common pattern: TOR-DMHPUN220826A  or  DC/2024-25/1234\n"
+        "Often printed at the bottom of the page — do NOT stop after checking the header.\n"
+        "Return null ONLY after the entire document has been searched.\n"
     )
     
     return system_prompt, user_prompt
@@ -1380,20 +1574,31 @@ def get_totals_prompt() -> tuple[str, str]:
     """
     Get prompts for extracting totals fields only (Pass 1b).
     Returns: (system_prompt, user_prompt)
+    
+    CRITICAL: Totals pass uses LIGHTWEIGHT prompt (no batch code rules).
     """
     system_prompt = (
-        "You are an invoice data extraction engine. Extract ONLY financial totals.\n"
-        "Output ONLY valid JSON. First character MUST be {.\n"
-        "No markdown, no explanation, no preamble.\n"
-        "CRITICAL: Extract from the CURRENT invoice ONLY. Never use memory, cached values,\n"
-        "or information from previous invoices. Every value must come from this invoice's OCR.\n"
-        "GST%: If not printed, derive as CGST Rate + SGST Rate + IGST Rate. Never return null\n"
-        "when component rates are available.\n"
-        "GST_AMT: Never return 0 when CGST/SGST/IGST amounts exist — sum them.\n"
+        "You are an invoice totals extraction engine.\n"
+        "Extract ONLY financial totals (amounts, GST rates, quantities).\n"
+        "Output ONLY valid JSON. First character MUST be {. No markdown, no explanation.\n\n"
+        
+        "CRITICAL RULES:\n"
+        "1. Extract from CURRENT invoice ONLY\n"
+        "2. GST%: If not printed, derive as CGST% + SGST% + IGST%\n"
+        "3. total_gst_amount: Sum CGST + SGST + IGST if not printed\n"
+        "4. Remove commas from numbers (1,775.00 → 1775.00)\n"
+        "5. total_quantity: Count PAID items only (if '20+2', count 20)\n"
+        "6. ⚠️ CGST/SGST RATE RULE (CRITICAL):\n"
+        "   CGST rate and SGST rate are each HALF of the total GST rate.\n"
+        "   If invoice shows '5% GST' with CGST+SGST split:\n"
+        "     total_gst_rate=5, total_cgst_rate=2.5, total_sgst_rate=2.5\n"
+        "   NEVER report total_cgst_rate=5 when it is the component (half) rate.\n"
+        "   If invoice explicitly prints CGST=2.5% → use 2.5, NOT 5.\n"
+        "   If invoice prints total GST=5% and CGST column shows 2.5% → cgst_rate=2.5.\n"
     )
     
     user_prompt = (
-        "Extract ONLY these financial total fields from the invoice:\n\n"
+        "Extract ONLY these totals fields:\n\n"
         "{\n"
         '  "invoice_amount": null,\n'
         '  "round_off": null,\n'
@@ -1407,18 +1612,8 @@ def get_totals_prompt() -> tuple[str, str]:
         '  "total_igst_amount": 0,\n'
         '  "total_gst_amount": null\n'
         "}\n\n"
-        "Rules:\n"
-        "- Rates are PERCENTAGES (e.g., 6, 12, 18)\n"
-        "- Amounts are MONETARY VALUES (e.g., 120.50, 1775.00)\n"
-        "- Remove commas from numbers\n"
-        "- If total_gst_amount missing: calculate as cgst + sgst + igst\n"
-        "- total_quantity = Sum of PAID quantities ONLY (exclude free items after '+')\n"
-        "  • If invoice shows '20+2', only count 20\n"
-        "  • Even if invoice prints 'Total Qty: 38', use the calculated paid-only value\n"
-        "- Extract from SUMMARY/TOTALS section (after line items table)\n"
-        "- Look for: 'Total', 'Grand Total', 'TO PAY', 'Net Amount'\n"
-        "- taxable_amount: from 'TAXABLE', 'TAXABLE AMT', 'ASSESSABLE VALUE'\n"
-        "- invoice_amount: from 'TO PAY', 'NET AMOUNT', 'GRAND TOTAL'\n"
+        "Find from: TOTALS/SUMMARY section (after line items table)\n"
+        "Look for: 'Total', 'Grand Total', 'TO PAY', 'Net Amount'\n"
     )
     
     return system_prompt, user_prompt
@@ -1484,16 +1679,52 @@ def get_items_prompt() -> tuple[str, str]:
         "its header. Never shift values between adjacent columns.\n"
         "GST%: Derive as CGST+SGST if not printed. Never null when rates are available.\n"
         "GST_AMT: Never 0 when component amounts exist — sum them.\n"
-        "PACK: Normalize — add space between number and unit (10S→10 S, 10TAB→10 TAB).\n"
+        "PACK: Extract as-is, preserve volume/dosage. Examples: '1.2 ML', '15 CAP', '10 TAB'.\n"
+        "  Don't aggressively normalize: '1.2 ML' stays '1.2 ML' (not just '1').\n"
         "EXPIRY DATE: Always DD-MM-YYYY. Convert MM/YY format.\n"
         "OCR CHARACTER CONFUSION — applies to ALL fields (batch, description, item code, etc.):\n"
-        "  1↔I↔l  0↔O  8↔B  5↔S  2↔Z  6↔G  4↔A  U↔V\n"
+        "  1↔I↔l  0↔O  8↔B  5↔S  2↔Z  6↔G  4↔A  U↔V  W↔V  M↔N  J↔1\n"
         "  Use field context to resolve: digits expected → letter shape is a digit; word context → digit shape is a letter.\n"
         "  BATCH RULE (most important): check the NEIGHBOURS of the ambiguous character.\n"
         "    If surrounded by LETTERS → it is a LETTER. e.g., RUA?2505A → 'RUAI2505A' (NOT 'RUA12505A')\n"
         "    If surrounded by DIGITS  → it is a DIGIT.  e.g., AB?2505  → 'AB12505'\n"
         "  Examples: 'B928.00' in amount → '8928.00' | 'PHARMAACEUTICAL' → 'PHARMACEUTICAL' (extra U)\n"
         "  When truly ambiguous → copy exactly as printed, do NOT guess.\n"
+        "\n"
+        "⚠️⚠️⚠️ HIGH-FREQUENCY BATCH OCR ERRORS — MEMORISE THESE:\n"
+        "\n"
+        "  1. W ↔ V  (single most common confusion)\n"
+        "     W has THREE downward points forming an M-shape mirrored.\n"
+        "     V has only TWO strokes meeting at a single bottom point.\n"
+        "     Width test: W is noticeably WIDER than V.\n"
+        "     ❌ ABVG0002  ✅ ABWG0002  (V→W because W is wider)\n"
+        "     ❌ 2F79V007  ✅ 2F79W007\n"
+        "\n"
+        "  2. M ↔ N  (common in alphanumeric batch codes)\n"
+        "     M has FOUR strokes: two outer verticals + two diagonals meeting in the middle.\n"
+        "     N has THREE strokes: two verticals + one diagonal.\n"
+        "     Width test: M is wider than N.\n"
+        "     ❌ ENV261280A  ✅ EMV261280A  (N→M because 'EM' is a letter pair, M is wider)\n"
+        "     Rule: if a character sits between two letters and looks like it could be\n"
+        "           either M or N, count its vertical strokes: 4=M, 3=N.\n"
+        "\n"
+        "  3. J ↔ 1  (letter J vs digit 1 inside a batch number)\n"
+        "     J is a letter with a hook at the bottom.\n"
+        "     1 is a digit — a straight vertical stroke, sometimes with a serif top.\n"
+        "     Neighbour rule: if the character is between DIGITS → it is digit '1'.\n"
+        "     ❌ RFJ826001  ✅ RF1826001  (J→1 because '826001' are all digits around it)\n"
+        "\n"
+        "  4. O ↔ A  in product descriptions\n"
+        "     In drug names the letter after 'SYM' matters.\n"
+        "     ❌ SYMBOL 60 TAB  ✅ SYMBAL 60 TAB  (the letter is A, not O)\n"
+        "     When a drug name has an unusual spelling, trust the printed characters\n"
+        "     rather than correcting to an English word you recognise.\n"
+        "\n"
+        "  VERIFICATION SEQUENCE FOR EVERY BATCH CHARACTER:\n"
+        "  Step 1: Count strokes (W=4 peaks, M=4 strokes, N=3 strokes, V=2 strokes)\n"
+        "  Step 2: Check width relative to neighbours\n"
+        "  Step 3: Apply neighbour rule (letters→letter, digits→digit)\n"
+        "  Step 4: Only after all three steps, write the character\n"
     )
     
     user_prompt = (
@@ -1649,4 +1880,138 @@ def get_items_prompt() -> tuple[str, str]:
         "- For single-item invoices: apply summary GST values to that item\n"
     )
     
+    return system_prompt, user_prompt
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BATCH RECHECK PROMPT  (zoom-in row-crop pass)
+# ─────────────────────────────────────────────────────────────────────────────
+def get_batch_recheck_prompt(
+    prior_description: str = "",
+    prior_batch: str = "",
+    prior_code: str = "",
+    read_index: int = 0,          # 0 = first read, 1 = second independent read
+) -> tuple[str, str]:
+    """
+    Prompt for a single Flash read of one zoomed invoice row.
+
+    read_index=0  → First read (deterministic, temperature 0.0)
+    read_index=1  → Second independent read (temperature 0.6, slightly varied
+                    phrasing so the model doesn't just repeat itself)
+
+    Returns (system_prompt, user_prompt).
+    """
+
+    read_note = (
+        "\n\nIMPORTANT: This is your SECOND independent reading of this row.\n"
+        "Do NOT simply repeat the prior extraction. Look at the image fresh.\n"
+        "Pay special attention to characters that could be W/V, M/N, 1/I/J, 0/O.\n"
+    ) if read_index == 1 else ""
+
+    system_prompt = (
+        "You are a pharmaceutical invoice OCR specialist performing a CHARACTER-LEVEL "
+        "accuracy check on a SINGLE zoomed invoice row.\n\n"
+
+        "You will receive ONE image: a single row from an invoice table, "
+        "upscaled so characters are large and clear.\n\n"
+
+        "Your ONLY job: read THREE fields from this row:\n"
+        "  1. Batch number  (alphanumeric, e.g. ABWG0002, EMV261280A, RF1826001)\n"
+        "  2. Item code     (format AL-XX-XXXX or similar; blank string if absent)\n"
+        "  3. Description   (product name, e.g. TORPANEL 4 TAB, SYMBAL 60 TAB)\n\n"
+
+        "CHARACTER RULES — apply to EVERY character in Batch and item_code:\n\n"
+
+        "W vs V  (most common error):\n"
+        "  W = THREE downward points, WIDER character\n"
+        "  V = ONE downward point, narrower\n"
+        "  Count the downward points before writing\n\n"
+
+        "M vs N:\n"
+        "  M = FOUR strokes, wider\n"
+        "  N = THREE strokes, narrower\n"
+        "  Count strokes before writing\n\n"
+
+        "J vs 1: if surrounded by digits → digit 1, not letter J\n\n"
+
+        "0 vs O, 8 vs B, 5 vs S, 1 vs I:\n"
+        "  Digit neighbours → digit form\n"
+        "  Letter neighbours → letter form\n\n"
+
+        "Drug descriptions: copy branded names exactly — do NOT correct to English.\n"
+        "  SYMBAL, TORPANEL, STALIX etc. are correct even if they look misspelt.\n\n"
+
+        "OUTPUT: ONLY valid JSON, first character {, no markdown.\n"
+        '{"Batch": "...", "item_code": "...", "description": "..."}'
+        + read_note
+    )
+
+    prior_section = ""
+    if any([prior_description, prior_batch, prior_code]):
+        prior_section = (
+            "\n\nFIRST-PASS VALUES (may contain OCR errors — verify independently):\n"
+            f"  description : {prior_description or 'unknown'}\n"
+            f"  Batch       : {prior_batch or 'unknown'}\n"
+            f"  item_code   : {prior_code if prior_code is not None else 'unknown'}\n\n"
+            "Confirm OR correct. Focus on Batch — most errors are there.\n"
+        )
+
+    user_prompt = (
+        "Zoomed invoice row image attached.\n"
+        + prior_section
+        + "\nRead Batch, item_code, description. Apply W/V/M/N/J-1 rules per character.\n"
+        "Return ONLY JSON:\n"
+        '{"Batch": "...", "item_code": "...", "description": "..."}'
+    )
+
+    return system_prompt, user_prompt
+
+
+def get_batch_arbitration_prompt(
+    candidate_a: str,
+    candidate_b: str,
+    field: str = "Batch",
+    prior_description: str = "",
+) -> tuple[str, str]:
+    """
+    Prompt for Plus to arbitrate between two conflicting Flash reads.
+
+    Shown the zoomed image + both candidates, Plus must decide which is correct
+    (or provide a third option if both are wrong).
+
+    Returns (system_prompt, user_prompt).
+    """
+    system_prompt = (
+        "You are a senior pharmaceutical invoice OCR auditor.\n\n"
+
+        "Two independent OCR reads of the same invoice row DISAGREE on one field.\n"
+        "You will see the zoomed row image and both candidate values.\n"
+        "Your job: examine the image carefully and decide which is correct.\n\n"
+
+        "THIS IS THE DECIDING PASS. Be precise. Zoom in mentally on every character.\n\n"
+
+        f"The disagreement is on the {field.upper()} field.\n\n"
+
+        "CHARACTER VERIFICATION (mandatory before answering):\n"
+        "  For each character that differs between the two candidates:\n"
+        "  1. Count strokes: W=4 peaks/3 points, V=2 strokes/1 point, M=4, N=3\n"
+        "  2. Check width: W wider than V, M wider than N\n"
+        "  3. Check digit/letter context: surrounded by digits→digit, letters→letter\n"
+        "  4. Make a definitive call\n\n"
+
+        "OUTPUT: ONLY valid JSON, first character {, no markdown, no explanation.\n"
+        '{"Batch": "final_correct_value", "item_code": "...", "description": "...", '
+        '"arbitration_reason": "one sentence explaining which character and why"}'
+    )
+
+    user_prompt = (
+        f"Zoomed invoice row for: {prior_description or 'this item'}\n\n"
+        f"Two OCR reads disagree on {field}:\n"
+        f"  Read A: {candidate_a}\n"
+        f"  Read B: {candidate_b}\n\n"
+        "Examine the image. Which is correct?\n"
+        "If both are wrong, provide the correct value.\n"
+        "Return ONLY JSON with your final answer and a one-sentence reason."
+    )
+
     return system_prompt, user_prompt

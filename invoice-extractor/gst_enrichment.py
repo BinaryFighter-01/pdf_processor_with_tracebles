@@ -123,18 +123,21 @@ def enrich_item_gst(item: Dict[str, Any], is_intra_state: bool = True) -> Dict[s
         # ── Rounding consistency fix for CGST/SGST ────────────────────
         # Invoice printers sometimes show CGST=310.63, SGST=310.62 due to
         # rounding each component independently. Fix: make them equal.
-        if cgst_amt_existing is not None and sgst_amt_existing is not None:
-            # Both printed — check if they differ by only 0.01
+        # ONLY apply when CGST != SGST by exactly 1 paisa AND no GST_AMT
+        # is printed — if GST_AMT is printed, it is the authoritative value
+        # and we must not alter the components that sum to it.
+        gst_amt_printed = _to_float(item.get('GST_AMT'))
+        if (cgst_amt_existing is not None and sgst_amt_existing is not None
+                and gst_amt_printed is None):
             diff = abs(cgst_amt_existing - sgst_amt_existing)
-            if 0 < diff <= 0.02:  # Allow up to 2 paisa difference
-                # Make them equal by using the average
+            if 0 < diff <= 0.02:
                 avg = round_to_2((cgst_amt_existing + sgst_amt_existing) / 2)
                 item['cgst_amount'] = avg
                 item['sgst_amount'] = avg
                 cgst_amt_existing = avg
                 sgst_amt_existing = avg
-        
-        # Fill GST_AMT if missing
+
+        # Fill GST_AMT if missing — never overwrite a printed value
         if _to_float(item.get('GST_AMT')) is None:
             item['GST_AMT'] = round_to_2(
                 (cgst_amt_existing or 0) +
@@ -214,32 +217,79 @@ def enrich_totals_gst(data: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Enriched data dictionary
     """
-    total_gst_rate = data.get('total_gst_rate', 0) or 0
-    total_cgst_rate = data.get('total_cgst_rate', 0) or 0
-    total_sgst_rate = data.get('total_sgst_rate', 0) or 0
-    total_igst_rate = data.get('total_igst_rate', 0) or 0
-    
-    # Detect and fix common error: total_gst_rate = 10, cgst = 5, sgst = 5
-    # This is wrong: total should be 5, cgst should be 2.5, sgst should be 2.5
+    total_gst_rate = _to_float(data.get('total_gst_rate')) or 0
+    total_cgst_rate = _to_float(data.get('total_cgst_rate')) or 0
+    total_sgst_rate = _to_float(data.get('total_sgst_rate')) or 0
+    total_igst_rate = _to_float(data.get('total_igst_rate')) or 0
+
     if total_cgst_rate > 0 and total_sgst_rate > 0:
         # Intra-state transaction
-        if total_cgst_rate + total_sgst_rate != total_gst_rate:
-            # Rates don't add up - likely cgst and sgst are correctly half each
-            # So total_gst_rate should be cgst + sgst
-            corrected_total = total_cgst_rate + total_sgst_rate
-            if corrected_total != total_gst_rate:
-                print(f"⚠️  Correcting total_gst_rate: {total_gst_rate} → {corrected_total}")
-                print(f"   CGST: {total_cgst_rate}%, SGST: {total_sgst_rate}%")
-                data['total_gst_rate'] = corrected_total
-                data['_gst_rate_corrected'] = True
-    
+        component_sum = round_to_2(total_cgst_rate + total_sgst_rate)
+
+        # ── Pattern A: model reports CGST=half_rate, SGST=half_rate, total=full_rate ──
+        # Example: invoice has 5% GST. Model reads CGST column showing "5%" (the full
+        # rate printed next to "CGST" label) and also reads total as "5%".
+        # Result: total_gst_rate=10, cgst=5, sgst=5  ← WRONG
+        # Real:   total_gst_rate=5,  cgst=2.5, sgst=2.5 ← CORRECT
+        #
+        # Detection strategy: the stated total_gst_rate is NOT a standard Indian GST
+        # slab (3, 5, 12, 18, 28) but half of it IS a standard slab, AND components
+        # are equal whole numbers summing to the total.
+        #
+        # This is precise enough to avoid false positives on correct invoices.
+        VALID_GST_SLABS = {0, 0.1, 0.25, 1, 1.5, 3, 5, 6, 12, 18, 28}
+        halved_total = round_to_2(total_gst_rate / 2) if total_gst_rate else 0
+        is_pattern_a = (
+            total_gst_rate > 0
+            and total_gst_rate not in VALID_GST_SLABS       # total is NOT a valid slab
+            and halved_total in VALID_GST_SLABS              # but half of it IS
+            and abs(total_cgst_rate - total_sgst_rate) < 0.01  # cgst ≈ sgst
+            and abs(total_gst_rate - 2 * total_cgst_rate) < 0.05  # total ≈ 2×cgst
+        )
+
+        if is_pattern_a:
+            corrected_cgst  = round_to_2(total_cgst_rate / 2)
+            corrected_sgst  = round_to_2(total_sgst_rate / 2)
+            corrected_total = round_to_2(total_gst_rate  / 2)
+            print(f"[GST] Pattern A (doubled component rates detected):")
+            print(f"   Correcting: total {total_gst_rate}->{corrected_total}  "
+                  f"cgst {total_cgst_rate}->{corrected_cgst}  "
+                  f"sgst {total_sgst_rate}->{corrected_sgst}")
+            data['total_gst_rate']  = corrected_total
+            data['total_cgst_rate'] = corrected_cgst
+            data['total_sgst_rate'] = corrected_sgst
+            data['_gst_rate_corrected'] = True
+
+        elif total_gst_rate > 0 and abs(component_sum - total_gst_rate) > 0.01:
+            # Pattern B: component rates are correct but total is stated wrong
+            print(f"[GST] Correcting total_gst_rate: {total_gst_rate} -> {component_sum}")
+            print(f"   CGST: {total_cgst_rate}%, SGST: {total_sgst_rate}%")
+            data['total_gst_rate'] = component_sum
+            data['_gst_rate_corrected'] = True
+
+        elif total_gst_rate == 0 and component_sum > 0:
+            # total_gst_rate is missing — derive from components
+            data['total_gst_rate'] = component_sum
+            data['_gst_rate_corrected'] = True
+
+        # Final consistency check: ensure cgst == sgst (intra-state rule)
+        # Re-read after any corrections above
+        cgst_final = _to_float(data.get('total_cgst_rate')) or 0
+        sgst_final = _to_float(data.get('total_sgst_rate')) or 0
+        if cgst_final > 0 and sgst_final > 0 and abs(cgst_final - sgst_final) > 0.01:
+            # Make them equal using the average
+            avg_rate = round_to_2((cgst_final + sgst_final) / 2)
+            data['total_cgst_rate'] = avg_rate
+            data['total_sgst_rate'] = avg_rate
+            print(f"[GST] CGST/SGST rates equalised to {avg_rate}%")
+
     elif total_igst_rate > 0:
         # Inter-state transaction
         if total_gst_rate != total_igst_rate:
-            print(f"⚠️  Correcting total_gst_rate: {total_gst_rate} → {total_igst_rate}")
+            print(f"[GST] Correcting total_gst_rate: {total_gst_rate} -> {total_igst_rate}")
             data['total_gst_rate'] = total_igst_rate
             data['_gst_rate_corrected'] = True
-    
+
     return data
 
 

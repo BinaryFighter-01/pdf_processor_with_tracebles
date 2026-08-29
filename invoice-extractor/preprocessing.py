@@ -18,18 +18,13 @@ class OrientationDetector:
     """
     
     def __init__(self):
+        # OCR is disabled - using visual heuristics only
         self.ocr_ready = False
         self.ocr_client = None
-        self._init_ocr()
     
     def _init_ocr(self):
-        try:
-            from ocr_client import QianfanOCRClient
-            self.ocr_client = QianfanOCRClient()
-            self.ocr_ready = True
-            print('[OK] Qianfan OCR (Baidu) loaded for orientation detection.')
-        except Exception as e:
-            print(f'[WARNING] Qianfan OCR unavailable ({e}). Using heuristic only.')
+        # DISABLED: Qianfan OCR removed, using heuristic-only detection
+        pass
     
     @staticmethod
     def _rotate_exact(img_np: np.ndarray, angle: int) -> np.ndarray:
@@ -203,21 +198,28 @@ class ImagePreprocessor:
     
     @staticmethod
     def enhance_contrast(pil_img: Image.Image) -> Image.Image:
-        """Enhance image contrast using adaptive histogram equalization."""
+        """
+        Enhance image contrast using CLAHE on the L channel (LAB space).
+
+        Skips enhancement for already-high-contrast images (digital PDFs).
+        Only applies CLAHE when the image stddev indicates a flat histogram
+        (scanned/faded invoices). This avoids amplifying JPEG artifacts on
+        clean digital PDFs.
+        """
         img_np = np.array(pil_img.convert('RGB'))
-        
-        # Convert to LAB color space
+        gray   = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+
+        # If contrast is already good (stddev > 60), skip — don't touch clean PDFs
+        if float(np.std(gray)) > 60.0:
+            return pil_img
+
+        # Apply CLAHE to L channel only
         lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
         l, a, b = cv2.split(lab)
-        
-        # Apply CLAHE to L channel
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         l = clahe.apply(l)
-        
-        # Merge and convert back
         lab = cv2.merge([l, a, b])
         enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-        
         return Image.fromarray(enhanced)
     
     @staticmethod
@@ -232,56 +234,54 @@ class ImagePreprocessor:
         """
         Crop uniform-colored border regions (scanner margins, shadows).
         
-        Finds content by locating where pixels differ significantly from the
-        dominant edge color. Handles both white borders (scanned documents)
-        and black borders (photo backgrounds).
-        
-        Args:
-            pil_img: Input PIL Image
-            threshold: Grayscale brightness cutoff (>240 = white border, <15 = black border)
-            min_crop: Minimum pixels to crop (prevents false crop on borderless images)
-        
-        Returns:
-            Cropped PIL Image with borders removed
+        SAFE VERSION: caps crop at 2% of each dimension to prevent
+        accidentally removing invoice content at edges (dark headers,
+        batch codes near margins, footer totals).
         """
         img_np = np.array(pil_img.convert('RGB'))
         gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
         h, w = gray.shape
-        
+
+        # Max 2% of image dimension — prevents content loss
+        max_crop_h = int(h * 0.02)
+        max_crop_w = int(w * 0.02)
+
         # Sample edge pixels to detect dominant border color
         edge_pixels = np.concatenate([
-            gray[0, :],       # top row
-            gray[-1, :],      # bottom row
-            gray[:, 0],       # left column
-            gray[:, -1]       # right column
+            gray[0, :],    # top row
+            gray[-1, :],   # bottom row
+            gray[:, 0],    # left column
+            gray[:, -1]    # right column
         ])
         edge_median = np.median(edge_pixels)
-        
+
         # Detect border type: white (>240) or black (<15)
         if edge_median > threshold:
-            # White border: find dark content pixels
-            mask = gray < threshold
+            mask = gray < threshold   # find dark content in white border
         else:
-            # Black border: find bright content pixels
-            mask = gray > 15
-        
-        # Find content bounding box
+            mask = gray > 15          # find bright content in black border
+
         rows = np.any(mask, axis=1)
         cols = np.any(mask, axis=0)
-        
+
         if not rows.any() or not cols.any():
-            # No detectable border or fully uniform image — return unchanged
             return pil_img
-        
+
         y_min, y_max = np.where(rows)[0][[0, -1]]
         x_min, x_max = np.where(cols)[0][[0, -1]]
-        
-        # Only crop if border is significant (prevents false crops)
-        crop_top    = y_min if y_min >= min_crop else 0
-        crop_bottom = y_max + 1 if (h - y_max) >= min_crop else h
-        crop_left   = x_min if x_min >= min_crop else 0
-        crop_right  = x_max + 1 if (w - x_max) >= min_crop else w
-        
+
+        # Only crop if detected border is within the safe 2% cap
+        crop_top    = min(y_min, max_crop_h)    if y_min >= min_crop else 0
+        crop_bottom = max(y_max + 1, h - max_crop_h) if (h - y_max - 1) >= min_crop else h
+        crop_left   = min(x_min, max_crop_w)    if x_min >= min_crop else 0
+        crop_right  = max(x_max + 1, w - max_crop_w) if (w - x_max - 1) >= min_crop else w
+
+        # Safety: never crop more than 2% from any side
+        crop_top    = max(crop_top,    0)
+        crop_bottom = min(crop_bottom, h)
+        crop_left   = max(crop_left,   0)
+        crop_right  = min(crop_right,  w)
+
         cropped = img_np[crop_top:crop_bottom, crop_left:crop_right]
         return Image.fromarray(cropped)
 
@@ -406,3 +406,204 @@ class ImagePreprocessor:
         debug_info['final_size'] = processed.size
         
         return processed, debug_info
+
+
+
+@traceable(name="extract_table_region", tags=["preprocessing", "cropping"])
+def extract_table_region(pil_img: Image.Image, expand_ratio: float = 1.2) -> Image.Image:
+    """
+    Extract the item table region from invoice for high-resolution batch code extraction.
+    
+    Strategy:
+    1. Find horizontal lines (table borders)
+    2. Crop to table region
+    3. Return at FULL resolution for character-level accuracy
+    
+    Args:
+        pil_img: Full invoice image
+        expand_ratio: How much to expand detected table region (default 1.2 = 20% padding)
+    
+    Returns:
+        Cropped PIL Image containing just the table region at full resolution
+    """
+    img_np = np.array(pil_img.convert('RGB'))
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape
+    
+    # Detect horizontal lines (table borders)
+    edges = cv2.Canny(gray, 50, 150)
+    
+    # Detect horizontal lines using morphology
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (w // 20, 1))
+    horizontal_lines = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, horizontal_kernel)
+    
+    # Find contours
+    contours, _ = cv2.findContours(horizontal_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:
+        print("⚠️  No table detected - returning full image")
+        return pil_img
+    
+    # Find the largest rectangular region (likely the table)
+    max_area = 0
+    table_bbox = None
+    
+    for contour in contours:
+        x, y, w_box, h_box = cv2.boundingRect(contour)
+        area = w_box * h_box
+        
+        # Filter: must be at least 30% of image width and 20% of height
+        if w_box > w * 0.3 and h_box > h * 0.2 and area > max_area:
+            max_area = area
+            table_bbox = (x, y, w_box, h_box)
+    
+    if table_bbox is None:
+        print("⚠️  Table region too small - returning full image")
+        return pil_img
+    
+    # Expand bbox for safety
+    x, y, w_box, h_box = table_bbox
+    center_x = x + w_box // 2
+    center_y = y + h_box // 2
+    
+    new_w = int(w_box * expand_ratio)
+    new_h = int(h_box * expand_ratio)
+    
+    x1 = max(0, center_x - new_w // 2)
+    y1 = max(0, center_y - new_h // 2)
+    x2 = min(w, center_x + new_w // 2)
+    y2 = min(h, center_y + new_h // 2)
+    
+    # Crop
+    cropped_np = img_np[y1:y2, x1:x2]
+    cropped_pil = Image.fromarray(cropped_np)
+    
+    print(f"✂️  Table region extracted: {x1},{y1} → {x2},{y2} ({x2-x1}x{y2-y1})")
+    
+    return cropped_pil
+
+
+@traceable(name="crop_item_rows", tags=["preprocessing", "zoom"])
+def crop_item_rows(
+    pil_img: Image.Image,
+    n_items: int,
+    zoom_factor: float = 3.0,
+    padding_px: int = 12,
+    table_top_ratio: float = 0.25,
+    table_bottom_ratio: float = 0.92,
+) -> list[Image.Image]:
+    """
+    Crop each item row from an invoice table and return zoomed PIL images.
+
+    Strategy
+    --------
+    1. Locate the item-table vertical band by slicing away the header/footer
+       (configurable via table_top_ratio / table_bottom_ratio).
+    2. Find horizontal separators inside that band using ink-density projection:
+       rows with very low horizontal ink are row boundaries.
+    3. Split the band into N row strips (one per item).
+    4. Upscale each strip by zoom_factor (default 3x) using LANCZOS so that
+       4-5 px batch-code characters become 12-15 px — unambiguous for the model.
+
+    Parameters
+    ----------
+    pil_img          : Full-page preprocessed invoice image.
+    n_items          : Expected number of item rows (from first extraction pass).
+    zoom_factor      : Upscale multiplier applied to each row crop (default 3.0).
+    padding_px       : Extra pixels added above/below each row crop (at original scale).
+    table_top_ratio  : Fraction of image height where the item table starts.
+    table_bottom_ratio: Fraction of image height where the item table ends.
+
+    Returns
+    -------
+    List of PIL Images, one per item row, in order.
+    If detection fails or n_items == 0, returns [pil_img] (full image fallback).
+    """
+    if n_items == 0:
+        return [pil_img]
+
+    img_np = np.array(pil_img.convert('L'))   # grayscale numpy
+    full_h, full_w = img_np.shape
+
+    # ── Step 1: restrict to table vertical band ──────────────────────────────
+    y_top    = int(full_h * table_top_ratio)
+    y_bottom = int(full_h * table_bottom_ratio)
+    band     = img_np[y_top:y_bottom, :]
+    band_h   = y_bottom - y_top
+
+    # ── Step 2: ink-density horizontal projection ─────────────────────────────
+    # Invert: white paper = 255 → 0 ink, black text = 0 → 255 ink
+    inv_band = 255 - band
+    row_ink  = inv_band.mean(axis=1)   # mean ink per horizontal line (float)
+
+    # Smooth slightly to handle dotted/dashed borders
+    kernel_size = max(3, band_h // 80)
+    kernel      = np.ones(kernel_size) / kernel_size
+    smoothed    = np.convolve(row_ink, kernel, mode='same')
+
+    # ── Step 3: find row boundaries via local minima ──────────────────────────
+    # A boundary is a run of low-ink pixels (border line or gap between rows).
+    ink_threshold = smoothed.max() * 0.15   # below 15% of max = boundary zone
+    is_boundary   = smoothed < ink_threshold
+
+    # Convert runs of boundary pixels → single y coordinate (midpoint of run)
+    boundaries = [0]   # always start from top of band
+    in_run = False
+    run_start = 0
+    for y, b in enumerate(is_boundary):
+        if b and not in_run:
+            in_run, run_start = True, y
+        elif not b and in_run:
+            boundaries.append((run_start + y) // 2)
+            in_run = False
+    boundaries.append(band_h)   # always end at bottom of band
+
+    # Remove duplicates / very close boundaries (< 10px apart)
+    clean_bounds = [boundaries[0]]
+    for b in boundaries[1:]:
+        if b - clean_bounds[-1] > 10:
+            clean_bounds.append(b)
+
+    # ── Step 4: map N items onto detected boundaries ──────────────────────────
+    # If we detected more boundaries than items, we have enough resolution.
+    # If fewer, fall back to equal-height slicing.
+    n_boundaries = len(clean_bounds) - 1   # number of detected intervals
+
+    if n_boundaries >= n_items:
+        # Use detected boundaries directly, merge extras at end if needed
+        row_intervals = []
+        step = n_boundaries / n_items
+        for i in range(n_items):
+            b_start = clean_bounds[int(round(i * step))]
+            b_end   = clean_bounds[min(int(round((i + 1) * step)), len(clean_bounds) - 1)]
+            row_intervals.append((b_start, b_end))
+    else:
+        # Equal-height fallback
+        row_h = band_h // n_items
+        row_intervals = [(i * row_h, (i + 1) * row_h) for i in range(n_items)]
+
+    # ── Step 5: crop, pad, zoom each row ─────────────────────────────────────
+    img_rgb = np.array(pil_img.convert('RGB'))
+    crops   = []
+
+    for (r_top, r_bot) in row_intervals:
+        # Convert back to full-image coordinates
+        abs_top = max(0,      y_top + r_top - padding_px)
+        abs_bot = min(full_h, y_top + r_bot + padding_px)
+
+        row_crop_np = img_rgb[abs_top:abs_bot, :]
+        row_pil     = Image.fromarray(row_crop_np)
+
+        # Zoom: upscale to make characters larger
+        new_w = int(row_pil.width  * zoom_factor)
+        new_h = int(row_pil.height * zoom_factor)
+        zoomed = row_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        crops.append(zoomed)
+
+    if not crops:
+        print("[crop_item_rows] No rows detected — returning full image")
+        return [pil_img]
+
+    print(f"[crop_item_rows] {len(crops)} row crops at {zoom_factor}x zoom "
+          f"({crops[0].width}x{crops[0].height} each)")
+    return crops

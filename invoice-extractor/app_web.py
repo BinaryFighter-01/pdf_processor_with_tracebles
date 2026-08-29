@@ -224,13 +224,13 @@ def extract_invoice():
             
             processed_image, preprocess_debug = preprocessor.process(
                 image,
-                do_orient=True if idx == 0 else False,  # Only detect orientation on first page
-                do_deskew=True,      # ✅ ENABLED — corrects tilted scans
-                do_enhance=True,     # ✅ already ON — contrast enhancement
-                do_denoise=False,    # OFF — too slow, blurs text
-                do_sharpen=True,     # ✅ ENABLED — sharpens text edges
-                do_crop_border=True, # ✅ ENABLED — removes scanner margins
-                do_binarize=False    # OFF unless invoice is genuinely faded
+                do_orient=False,     # ❌ DISABLED — heuristic-only (OCR removed), rotates correct images wrongly
+                do_deskew=False,     # ❌ DISABLED — Hough picks table lines, no angle cap, corrupts image
+                do_enhance=True,     # ✅ ENABLED — CLAHE contrast enhancement (safe, helps faded scans)
+                do_denoise=False,    # ❌ OFF — too slow, blurs text
+                do_sharpen=False,    # ❌ DISABLED — hard kernel halos batch code chars on JPEG artifacts
+                do_crop_border=True, # ✅ ENABLED — removes scanner margins (with safe 2% max-crop guard)
+                do_binarize=False    # ❌ OFF — only for genuinely faded invoices
             )
             
             # Log orientation details only for first page
@@ -851,6 +851,72 @@ def extract_invoice():
         if 'items' not in extracted_data:
             extracted_data['items'] = []
         
+        # ═══════════════════════════════════════════════════════════
+        # DETERMINISTIC total_price RECALCULATION
+        # ─────────────────────────────────────────────────────────
+        # PURPOSE: Fix the case where the model copies taxable_value into
+        # total_price instead of the GST-inclusive net amount.
+        #
+        # RULE: Only recalculate when the model's total_price is suspiciously
+        # equal to taxable_value (the known confusion pattern). If total_price
+        # already differs from taxable_value, the model read the AMOUNT column
+        # correctly — trust it. Never override a correctly-read printed value
+        # with a calculated sum that may have accumulated rounding error.
+        #
+        # This prevents ±0.01 errors like:
+        #   Invoice prints: 11124.80
+        #   Our calc:       10749.81 + 187.49 + 187.49 = 11124.79  ← wrong
+        # ═══════════════════════════════════════════════════════════
+        log_step("Checking total_price (override only when model confused taxable with total)...")
+        try:
+            from decimal import Decimal, ROUND_HALF_UP
+
+            def _dec(v):
+                """Convert to Decimal, return 0 for None/empty."""
+                if v is None or v == '' or v == 'null':
+                    return Decimal('0')
+                try:
+                    return Decimal(str(v).replace(',', '').replace('₹', '').strip())
+                except Exception:
+                    return Decimal('0')
+
+            total_price_fixes = 0
+            for item in extracted_data.get('items', []):
+                taxable = _dec(item.get('taxable_value'))
+                cgst    = _dec(item.get('cgst_amount'))
+                sgst    = _dec(item.get('sgst_amount'))
+                igst    = _dec(item.get('igst_amount'))
+                current = _dec(item.get('total_price'))
+
+                has_taxable = taxable > 0
+                has_gst     = (cgst + sgst + igst) > 0
+
+                if not (has_taxable and has_gst):
+                    continue
+
+                computed = (taxable + cgst + sgst + igst).quantize(
+                    Decimal('0.01'), rounding=ROUND_HALF_UP
+                )
+
+                # Only override when total_price == taxable_value (model confused columns)
+                # A tolerance of 0.02 handles trivial float/string conversion noise.
+                model_copied_taxable = abs(current - taxable) <= Decimal('0.02')
+
+                if model_copied_taxable:
+                    old_price = item.get('total_price')
+                    item['total_price'] = float(computed)
+                    total_price_fixes += 1
+                    log_step(f"  total_price fixed (was taxable): {old_price} -> {float(computed):.2f} "
+                             f"[{item.get('description', '')[:35]}]")
+                # else: model read the AMOUNT column correctly — leave it alone
+
+            if total_price_fixes == 0:
+                log_step("total_price: all values read correctly from invoice")
+            else:
+                log_step(f"total_price: {total_price_fixes} item(s) corrected (taxable->net)")
+        except Exception as tp_err:
+            log_step(f"total_price check error (non-fatal): {tp_err}")
+
         # ═══════════════════════════════════════════════════════════
         # FORMAT MONETARY FIELDS WITH 2 DECIMALS (AS STRINGS)
         # ═══════════════════════════════════════════════════════════

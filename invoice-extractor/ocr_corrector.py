@@ -191,6 +191,227 @@ def correct_date(value: Any) -> Optional[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Batch code: ambiguity detection and known-batch correction
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Characters that are visually ambiguous in small compressed JPEG text
+_BATCH_AMBIGUOUS_PAIRS = [
+    ('W', 'V'),   # most common — W misread as V
+    ('M', 'N'),   # second most common
+    ('1', 'J'),   # digit 1 vs letter J  (J→1 when surrounded by digits)
+    ('1', 'I'),   # digit 1 vs letter I
+    ('0', 'O'),   # digit 0 vs letter O
+    ('8', 'B'),   # rare but happens
+    ('5', 'S'),   # rare
+]
+
+# Only swap these pairs when both neighbours suggest the same type
+# (digit-only neighbours → must be digit; letter-only neighbours → must be letter)
+# For W/V and M/N we always swap — they're both letters, context doesn't help
+_CONTEXT_SENSITIVE_PAIRS = {
+    ('1', 'J'), ('1', 'I'),   # digit vs letter — use neighbours
+    ('0', 'O'),               # digit vs letter — use neighbours
+    ('8', 'B'),               # digit vs letter — use neighbours
+    ('5', 'S'),               # digit vs letter — use neighbours
+}
+_ALWAYS_SWAP_PAIRS = {
+    ('W', 'V'), ('V', 'W'),
+    ('M', 'N'), ('N', 'M'),
+}
+_AMBIGUOUS_CHARS = set()
+for a, b in _BATCH_AMBIGUOUS_PAIRS:
+    _AMBIGUOUS_CHARS.add(a.upper())
+    _AMBIGUOUS_CHARS.add(b.upper())
+
+# Per-invoice batch registry: built from the first pass, used to cross-check
+# subsequent items on the same invoice. For example if batch "ABWG0002" appears
+# on invoice/seller X, and later we see "ABVG0002" for the same seller, we know
+# W/V confusion happened.
+#
+# This is populated dynamically by apply_ocr_corrections() at call time.
+# It does NOT persist across invoices.
+
+
+def _batch_has_ambiguous_chars(batch: str) -> list[int]:
+    """Return list of positions in batch string that contain ambiguous characters."""
+    return [i for i, c in enumerate(batch.upper()) if c in _AMBIGUOUS_CHARS]
+
+
+def _batch_alternatives(batch: str) -> list[str]:
+    """
+    Generate 1-char substitution variants of a batch string using the confusion
+    pair map, filtered by neighbour context for digit/letter ambiguous pairs.
+
+    Rules:
+    - W/V and M/N: always generate the swap (both are letters)
+    - 1/J, 1/I, 0/O, 8/B, 5/S: only swap when both adjacent characters
+      suggest the replacement type (digit neighbours → use digit form,
+      letter neighbours → use letter form)
+
+    Returns list of corrected variants (may be empty).
+    """
+    variants = []
+    upper = batch.upper()
+    n = len(upper)
+
+    # Build pair map: char → its confusion partner
+    pair_map: dict[str, str] = {}
+    for a, b in _BATCH_AMBIGUOUS_PAIRS:
+        pair_map[a.upper()] = b.upper()
+        pair_map[b.upper()] = a.upper()
+
+    def _is_digit(c: str) -> bool:
+        return c.isdigit()
+
+    def _is_letter(c: str) -> bool:
+        return c.isalpha()
+
+    for i, char in enumerate(upper):
+        if char not in pair_map:
+            continue
+
+        partner = pair_map[char]
+        pair_key_fwd = (char, partner)
+        pair_key_rev = (partner, char)
+
+        # Always-swap pairs (W↔V, M↔N)
+        if pair_key_fwd in _ALWAYS_SWAP_PAIRS or pair_key_rev in _ALWAYS_SWAP_PAIRS:
+            swapped = list(upper)
+            swapped[i] = partner
+            variants.append(''.join(swapped))
+            continue
+
+        # Context-sensitive pairs: apply neighbour rule
+        # Look at left and right neighbours (skip if at boundary)
+        left  = upper[i - 1] if i > 0     else None
+        right = upper[i + 1] if i < n - 1 else None
+
+        neighbours = [c for c in [left, right] if c is not None]
+        n_digits  = sum(1 for c in neighbours if _is_digit(c))
+        n_letters = sum(1 for c in neighbours if _is_letter(c))
+
+        # Partner is a digit: only propose if both neighbours are digits
+        if _is_digit(partner) and n_digits == len(neighbours) and len(neighbours) > 0:
+            swapped = list(upper)
+            swapped[i] = partner
+            variants.append(''.join(swapped))
+
+        # Partner is a letter: only propose if both neighbours are letters
+        elif _is_letter(partner) and n_letters == len(neighbours) and len(neighbours) > 0:
+            swapped = list(upper)
+            swapped[i] = partner
+            variants.append(''.join(swapped))
+
+        # Mixed or boundary — generate the swap (conservative: let registry decide)
+        else:
+            swapped = list(upper)
+            swapped[i] = partner
+            variants.append(''.join(swapped))
+
+    return variants
+
+
+def correct_batch_with_registry(batch: str, registry: set[str]) -> tuple[str, bool]:
+    """
+    Try to correct a batch code by checking if any 1-char swap matches a
+    previously seen batch on this invoice.
+
+    Args:
+        batch    : The batch string to check (may contain OCR error).
+        registry : Set of batches already confirmed on this invoice.
+
+    Returns:
+        (corrected_batch, was_corrected)
+
+    This handles the case where ABWG0002 appears on item 3 correctly, then
+    ABVG0002 appears on item 7 for the same product family. The registry
+    contains ABWG0002, so when we see ABVG0002 we generate variant ABWG0002,
+    find it in the registry, and correct.
+    """
+    if not batch or not registry:
+        return batch, False
+
+    upper = batch.upper()
+    if upper in registry:
+        return batch, False   # already correct, already in registry
+
+    for variant in _batch_alternatives(upper):
+        if variant in registry:
+            print(f"[OCR-FIX] Batch '{batch}' corrected to '{variant}' (registry match)")
+            return variant, True
+
+    return batch, False
+
+
+def flag_ambiguous_batches(items: list[dict]) -> list[dict]:
+    """
+    Two-pass algorithm over all items in an invoice:
+
+    Pass 1 — Build a registry of all batch strings that contain NO ambiguous
+             characters (i.e. unambiguous batches we can trust as ground truth).
+
+    Pass 2 — For each item whose batch HAS ambiguous characters, check if any
+             1-char swap matches a registry entry. If yes → correct it.
+             If no registry match → mark the item with _batch_ambiguous=True
+             so the reviewer knows to double-check it.
+
+    Also detects same-batch duplicates with 1-char difference (e.g. ABWG0002
+    and ABVG0002 both appear on the invoice) and corrects the second to match
+    the first.
+    """
+    if not items:
+        return items
+
+    # ── Pass 1: build registry of unambiguous batches ────────────────────────
+    clean_registry: set[str] = set()
+    for item in items:
+        batch = str(item.get('Batch') or '').strip().upper()
+        if not batch:
+            continue
+        ambig = _batch_has_ambiguous_chars(batch)
+        if not ambig:
+            clean_registry.add(batch)
+
+    # ── Pass 2: correct or flag ambiguous batches ─────────────────────────────
+    # Also build a running registry that grows as we confirm batches,
+    # so later items can benefit from corrections made to earlier ones.
+    full_registry = set(clean_registry)
+
+    for item in items:
+        batch = str(item.get('Batch') or '').strip().upper()
+        if not batch:
+            continue
+
+        ambig_positions = _batch_has_ambiguous_chars(batch)
+        if not ambig_positions:
+            # No ambiguous chars — add to registry as ground truth
+            full_registry.add(batch)
+            continue
+
+        # Try to correct via registry
+        corrected, was_corrected = correct_batch_with_registry(batch, full_registry)
+
+        if was_corrected:
+            item['Batch'] = corrected
+            full_registry.add(corrected)
+            item.pop('_batch_ambiguous', None)
+        else:
+            # No registry match — flag for human review
+            ambig_chars = [batch[i] for i in ambig_positions]
+            item['_batch_ambiguous'] = True
+            item['_batch_ambiguous_chars'] = ambig_positions
+            alts = _batch_alternatives(batch)
+            if alts:
+                item['_batch_alternatives'] = alts
+            print(f"[OCR-FLAG] Batch '{batch}' has ambiguous chars {ambig_chars} "
+                  f"at positions {ambig_positions} — flagged for review. "
+                  f"Alternatives: {alts}")
+            full_registry.add(batch)   # add as-is so subsequent items can reference it
+
+    return items
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Top-level: apply all corrections to extracted invoice data
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -261,5 +482,14 @@ def apply_ocr_corrections(data: dict) -> dict:
         print(f"[OCR-FIX] Total corrections applied: {corrections_made}")
     else:
         print("[OCR-FIX] No corrections needed.")
+
+    # ── Batch ambiguity detection and cross-item correction ───────────────────
+    # Run AFTER all individual item corrections so HSN/code are already clean.
+    # This pass cross-references batches across all items on the invoice to
+    # catch W/V, M/N, 1/I confusion that neither the model nor zoom-recheck
+    # can reliably resolve from a single ambiguous character's pixels alone.
+    items = data.get('items', [])
+    if items:
+        data['items'] = flag_ambiguous_batches(items)
 
     return data

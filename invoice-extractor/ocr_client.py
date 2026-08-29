@@ -20,7 +20,10 @@ class QianfanOCRClient:
     
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.getenv('OPENROUTER_API_KEY')
-        self.model = 'baidu/qianfan-ocr-fast:free'
+        # ⚠️ CRITICAL FIX: baidu/qianfan-ocr-fast:free does NOT exist on OpenRouter
+        # OpenRouter does not have dedicated OCR models - it's for chat/completion models
+        # Using a vision model instead for orientation detection
+        self.model = 'qwen/qwen-2-vl-7b-instruct'  # Free vision model for OCR tasks
         self.base_url = 'https://openrouter.ai/api/v1/chat/completions'
         
         if not self.api_key:

@@ -60,11 +60,37 @@ class OpenRouterClient:
     
     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
         self.api_key = api_key or os.getenv('OPENROUTER_API_KEY')
-        self.model = model or os.getenv('MODEL_NAME', 'qwen/qwen3.7-plus')
-        self.base_url = 'https://openrouter.ai/api/v1/chat/completions'
         
+        # ── Primary model (accuracy-critical: batch codes, item descriptions) ──────
+        # Qwen 3.7 Plus — best character-level accuracy for batch codes (W/V, M/N, J/1)
+        self.model         = model or os.getenv('MODEL_NAME', 'qwen/qwen3.7-plus')
+        self.PRIMARY_MODEL = self.model
+
+        # ── Fast model (speed/cost-optimised: header fields, totals, verification) ──
+        # Qwen 3.7 Flash — 13x cheaper, same vision capability, sufficient for
+        # large-text fields (invoice#, names, GSTINs, amounts) where character-level
+        # accuracy on tiny batch codes is NOT required.
+        # Set FAST_MODEL_NAME= in .env to override. Set to same as MODEL_NAME to disable.
+        self.FAST_MODEL    = os.getenv('FAST_MODEL_NAME', 'qwen/qwen3.7-flash')
+
+        # ── Separate API key for Fast model (optional) ────────────────────────────
+        # If you have a second OpenRouter account / key for Flash, set FAST_MODEL_API_KEY.
+        # If not set, the same OPENROUTER_API_KEY is used for both models.
+        self.fast_api_key  = os.getenv('FAST_MODEL_API_KEY') or self.api_key
+
+        self.FALLBACK_MODEL = None  # No fallback - explicit model routing only
+
+        self.base_url = 'https://openrouter.ai/api/v1/chat/completions'
         if not self.api_key:
             raise ValueError("OPENROUTER_API_KEY not found in environment variables")
+
+        flash_label = (
+            f"{self.FAST_MODEL} (separate key)"
+            if os.getenv('FAST_MODEL_API_KEY')
+            else f"{self.FAST_MODEL} (same key)"
+        )
+        print(f"Primary model : {self.model}  (items pass — max accuracy)")
+        print(f"Fast model    : {flash_label}  (header/totals — speed+cost)")
     
     @staticmethod
     def repair_json(json_str: str) -> str:
@@ -122,94 +148,152 @@ class OpenRouterClient:
         return json_str
     
     @staticmethod
-    def image_to_base64(pil_image: Image.Image, format: str = 'PNG', max_size: int = 8192) -> str:
+    def image_to_base64(pil_image: Image.Image, format: str = 'PNG', max_size: int = 8192, model_name: str = '') -> str:
         """
-        Convert PIL Image to base64 string at maximum quality.
+        Convert PIL Image to base64, optimised for Qwen's 30MB payload limit.
 
-        Always uses PNG (lossless) regardless of image size — JPEG compression
-        degrades fine text (batch numbers, HSN codes, small-print amounts) and
-        directly causes OCR errors. Token cost is not a constraint, accuracy is.
+        Invoices are text/line documents — JPEG beats PNG on size with minimal
+        quality loss for text. Strategy:
+          Phase 1 — full resolution, JPEG 95 / 92 / 90 (3 quick attempts)
+          Phase 2 — scale down 15% per step, JPEG 95 each time (up to 8 steps)
+          Phase 3 — send whatever we have (Qwen may accept it anyway)
 
-        Args:
-            pil_image: PIL Image object
-            format: Ignored — always PNG for lossless quality
-            max_size: Maximum dimension in pixels (default 8192; covers 300-DPI A4 at full res)
+        Target: 7 MB raw → ~9.3 MB base64 → ~11 MB total payload (safe < 30 MB)
         """
-        # Always PNG — lossless preserves every pixel of fine invoice text
-        format = 'PNG'
+        TARGET_MB = 7.0
 
-        # Ensure RGB (PNG handles RGB cleanly; RGBA would add unnecessary alpha)
+        # Normalise to RGB
         if pil_image.mode not in ('RGB', 'L'):
             pil_image = pil_image.convert('RGB')
 
         width, height = pil_image.size
 
-        # Downscale only if genuinely oversized (e.g. 600 DPI scan > 8192 px)
+        # Hard cap at 8192 px (only fires for 600 DPI scans)
         if width > max_size or height > max_size:
-            if width > height:
-                new_width  = max_size
-                new_height = int(height * (max_size / width))
+            if width >= height:
+                new_w, new_h = max_size, int(height * max_size / width)
             else:
-                new_height = max_size
-                new_width  = int(width * (max_size / height))
-            pil_image = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            print(f"🔄 Image resized from {width}x{height} to {new_width}x{new_height} (still lossless PNG)")
+                new_h, new_w = max_size, int(width * max_size / height)
+            pil_image = pil_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            print(f"� Capped to {new_w}x{new_h} (was {width}x{height})")
         else:
-            print(f"📐 Image at full resolution: {width}x{height} px — no resize needed")
+            print(f"📐 Full resolution: {width}x{height}")
 
-        buffered = BytesIO()
-        # PNG with compress_level=1: fast compression, lossless quality
-        # Level 9 saves ~5% size but takes 10x longer — not worth it for invoices
-        pil_image.save(buffered, format='PNG', compress_level=1)
-        img_bytes  = buffered.getvalue()
-        img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+        def _jpeg(img, q):
+            buf = BytesIO()
+            img.save(buf, format='JPEG', quality=q, optimize=True, subsampling=0)
+            return buf.getvalue()
 
-        size_mb = len(img_bytes) / (1024 * 1024)
-        print(f"📦 Image encoded: {size_mb:.2f} MB as lossless PNG ({pil_image.width}x{pil_image.height})")
+        def _wrap(raw, mime):
+            b64 = base64.b64encode(raw).decode('utf-8')
+            return f"data:{mime};base64,{b64}", len(raw)/1048576, len(b64)/1048576
 
-        return f"data:image/png;base64,{img_base64}"
+        # ── Phase 1: full resolution, decreasing quality ─────────────────
+        for q in (95, 92, 90):
+            raw = _jpeg(pil_image, q)
+            url, raw_mb, b64_mb = _wrap(raw, 'image/jpeg')
+            print(f"   JPEG {q}%: {raw_mb:.2f} MB raw, {b64_mb:.2f} MB b64 ({pil_image.width}x{pil_image.height})")
+            if raw_mb <= TARGET_MB:
+                print(f"✅ Using JPEG {q}% at full resolution")
+                return url
+
+        # ── Phase 2: scale down 15% per step, JPEG 95 each time ──────────
+        print(f"⚠️  Full-res JPEG 90% still {raw_mb:.2f} MB — downscaling...")
+        current = pil_image
+        for step in range(1, 9):
+            w, h = current.size
+            current = current.resize((int(w * 0.85), int(h * 0.85)), Image.Resampling.LANCZOS)
+            raw = _jpeg(current, 95)
+            url, raw_mb, b64_mb = _wrap(raw, 'image/jpeg')
+            print(f"   Step {step}: {current.width}x{current.height} → {raw_mb:.2f} MB raw")
+            if raw_mb <= TARGET_MB:
+                print(f"✅ Fits at step {step}: {raw_mb:.2f} MB ({current.width}x{current.height})")
+                return url
+
+        # ── Phase 3: absolute fallback ────────────────────────────────────
+        print(f"⚠️  Could not reach {TARGET_MB} MB — sending {raw_mb:.2f} MB anyway")
+        return url
     
     @traceable(name="model_extract_invoice", tags=["model", "extraction"], metadata={"model": "qwen3.7-plus"})
     def extract_invoice(
         self,
-        image: Image.Image | list[Image.Image],  # NOW supports single image OR list of images
+        image: Image.Image | list[Image.Image],
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0.1,
         max_tokens: int = 16000,
-        use_reasoning: bool = True    # ON by default — reasoning critical for character-level accuracy
+        use_reasoning: bool = True
+    ) -> tuple[dict, dict]:
+        """Extract invoice data using the PRIMARY model (Qwen 3.7 Plus).
+        Use for items pass — requires maximum character-level accuracy."""
+        return self._call_model(
+            image, system_prompt, user_prompt, temperature, max_tokens,
+            use_reasoning, model_override=None, api_key_override=None
+        )
+
+    @traceable(name="model_extract_invoice_fast", tags=["model", "extraction", "fast"])
+    def extract_invoice_fast(
+        self,
+        image: Image.Image | list[Image.Image],
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.1,
+        max_tokens: int = 6000,
+        use_reasoning: bool = False
+    ) -> tuple[dict, dict]:
+        """Extract invoice data using the FAST model (Qwen 3.7 Flash).
+        Use for header and totals passes — large readable text, no batch codes.
+        Reasoning is OFF by default: Flash is fast enough without it for
+        straightforward field extraction.
+        Falls back to PRIMARY model if FAST_MODEL call fails."""
+        print(f"[FAST] Using {self.FAST_MODEL} for this pass")
+        result, raw = self._call_model(
+            image, system_prompt, user_prompt, temperature, max_tokens,
+            use_reasoning, model_override=self.FAST_MODEL,
+            api_key_override=self.fast_api_key
+        )
+        if 'error' in result:
+            print(f"[FAST] Flash failed ({result['error'][:80]}...) — falling back to Primary")
+            result, raw = self._call_model(
+                image, system_prompt, user_prompt, temperature, max_tokens,
+                use_reasoning, model_override=None, api_key_override=None
+            )
+        return result, raw
+
+    def _call_model(
+        self,
+        image: Image.Image | list[Image.Image],
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.1,
+        max_tokens: int = 16000,
+        use_reasoning: bool = True,
+        model_override: Optional[str] = None,
+        api_key_override: Optional[str] = None
     ) -> tuple[dict, dict]:
         """
-        Extract invoice data using vision model.
-        
-        Args:
-            image: Single PIL Image OR list of PIL Images (for multi-page context)
-            system_prompt: System instructions
-            user_prompt: User extraction request
-            temperature: Model temperature
-            max_tokens: Maximum output tokens
-            use_reasoning: Enable high-effort reasoning for character-level accuracy
-        
-        Returns:
-            Tuple of (extracted_data_dict, raw_response_dict)
+        Internal: call the specified model (or self.model if no override).
+        All callers should use extract_invoice() or extract_invoice_fast().
         """
+        active_model   = model_override   or self.model
+        active_api_key = api_key_override or self.api_key
         # Handle both single image and multiple images
         if isinstance(image, list):
             images = image
-            image_b64_list = [self.image_to_base64(img) for img in images]
-            print(f"📸 Sending {len(images)} images to model for extraction")
+            image_b64_list = [self.image_to_base64(img, model_name=active_model) for img in images]
+            print(f"Sending {len(images)} images to {active_model}")
         else:
             images = [image]
-            image_b64_list = [self.image_to_base64(image)]
-        
+            image_b64_list = [self.image_to_base64(image, model_name=active_model)]
+
         # Prepare request
         headers = {
-            'Authorization': f'Bearer {self.api_key}',
+            'Authorization': f'Bearer {active_api_key}',
             'Content-Type': 'application/json',
         }
-        
+
         payload = {
-            'model': self.model,
+            'model': active_model,
             'messages': [
                 {
                     'role': 'system',
@@ -236,26 +320,27 @@ class OpenRouterClient:
             'temperature': temperature,
             'max_tokens': max_tokens,
             # ── Reasoning / thinking control ────────────────────────────
-            # reasoning effort=high: model thinks through every ambiguous character
-            # before committing to a value (batch numbers, GSTINs, item codes).
-            # CRITICAL: exclude=True keeps reasoning tokens in the thinking buffer
-            # and does NOT count them against max_tokens — output budget is preserved.
-            # For cheap classification calls, use_reasoning=False disables thinking
-            # entirely (effort=none) to avoid unnecessary token spend.
+            # Gemini and Claude use internal reasoning (no explicit parameters needed)
+            # Qwen uses reasoning effort=high with exclude=True
+            # For this implementation, we check model type:
             **(
-                {
-                    'reasoning': {'effort': 'high', 'exclude': True},
-                    'reasoning_effort': 'high',
-                    'thinking': {'type': 'enabled'},
-                    'enable_thinking': True,
-                }
-                if use_reasoning else
-                {
-                    'reasoning': {'effort': 'none', 'exclude': True},
-                    'reasoning_effort': 'none',
-                    'thinking': {'type': 'disabled'},
-                    'enable_thinking': False,
-                }
+                {}  # Gemini/Claude: No reasoning params needed (they reason internally)
+                if any(x in active_model.lower() for x in ['gemini', 'claude', 'gpt']) else
+                (
+                    {
+                        'reasoning': {'effort': 'high', 'exclude': True},
+                        'reasoning_effort': 'high',
+                        'thinking': {'type': 'enabled'},
+                        'enable_thinking': True,
+                    }
+                    if use_reasoning else
+                    {
+                        'reasoning': {'effort': 'none', 'exclude': True},
+                        'reasoning_effort': 'none',
+                        'thinking': {'type': 'disabled'},
+                        'enable_thinking': False,
+                    }
+                )
             ),
         }
         
@@ -266,6 +351,43 @@ class OpenRouterClient:
         while retry_count <= max_retries:
             try:
                 timeout_duration = 300  # 5 minutes timeout for complex invoices
+                
+                # ⚠️ SAFETY CHECK: Measure actual payload size before sending
+                import json as json_lib
+                payload_str = json_lib.dumps(payload)
+                payload_size_mb = len(payload_str.encode('utf-8')) / (1024 * 1024)
+                print(f"📊 Total payload size: {payload_size_mb:.2f} MB")
+                
+                # Qwen/OpenRouter hard limit is 30MB
+                if payload_size_mb > 28:
+                    print(f"❌ CRITICAL: Payload {payload_size_mb:.2f} MB exceeds 28MB safe limit!")
+                    print(f"   Image base64 size: {len(image_b64_list[0]) / (1024 * 1024):.2f} MB")
+                    print(f"   System prompt: {len(system_prompt) / 1024:.2f} KB")
+                    print(f"   User prompt: {len(user_prompt) / 1024:.2f} KB")
+                    
+                    # Emergency: try aggressive JPEG compression
+                    if len(image_b64_list) == 1 and payload_size_mb < 35:
+                        print(f"🚨 Emergency: Re-compressing image with JPEG 90%...")
+                        emergency_img = images[0]
+                        buffered = BytesIO()
+                        emergency_img.save(buffered, format='JPEG', quality=90, optimize=True, subsampling=0)
+                        emergency_bytes = buffered.getvalue()
+                        emergency_size = len(emergency_bytes) / (1024 * 1024)
+                        emergency_b64 = base64.b64encode(emergency_bytes).decode('utf-8')
+                        emergency_b64_size = len(emergency_b64) / (1024 * 1024)
+                        print(f"   Emergency JPEG: {emergency_size:.2f} MB raw, {emergency_b64_size:.2f} MB base64")
+                        
+                        # Replace image in payload
+                        payload['messages'][1]['content'][1]['image_url']['url'] = f"data:image/jpeg;base64,{emergency_b64}"
+                        
+                        # Recalculate payload size
+                        payload_str = json_lib.dumps(payload)
+                        payload_size_mb = len(payload_str.encode('utf-8')) / (1024 * 1024)
+                        print(f"   New payload size: {payload_size_mb:.2f} MB")
+                    
+                    if payload_size_mb > 28:
+                        return {'error': f'Payload too large: {payload_size_mb:.2f} MB (limit: 28MB). Image compression failed.'}, {}
+                
                 print(f"🌐 Sending request to {self.model}... (attempt {retry_count + 1}/{max_retries + 1}, timeout: {timeout_duration}s)")
                 
                 response = requests.post(
@@ -378,11 +500,13 @@ class OpenRouterClient:
                                     print(f"   Retry: content still empty, reasoning={len(reasoning_text)} chars")
                                 else:
                                     print(f"   Retry succeeded: {len(text_response)} chars")
+                                    response_data = retry_data  # ⚠️ FIX: Update response_data
                         except Exception as retry_err:
                             print(f"   Retry failed: {retry_err}")
 
                     if text_response:
                         # Recovered on retry — continue to normal parse path below
+                        print(f"✅ text_response recovered ({len(text_response)} chars) — continuing to JSON parsing...")
                         pass
                     elif reasoning_text:
                         print(f"⚠️  content is empty — model used all tokens on reasoning ({len(reasoning_text)} chars).")
@@ -406,8 +530,67 @@ class OpenRouterClient:
                         print(f"❌ Could not recover JSON from reasoning. Increase max_tokens.")
                         print(f"   Reasoning tail (last 500): {reasoning_text[-500:]}")
                     else:
-                        print(f"⚠️  Empty content in message: {message}")
-                    return {'error': 'Model returned empty response'}, response_data
+                        # ⚠️⚠️⚠️ CRITICAL FIX: Retry with exponential backoff before failing
+                        print(f"⚠️  Empty content AND empty reasoning — attempting emergency retry...")
+                        import time
+                        retry_delays = [2, 5, 10]  # Wait 2s, 5s, 10s between retries
+                        
+                        for attempt, delay in enumerate(retry_delays, start=1):
+                            print(f"   🔄 Retry {attempt}/{len(retry_delays)} (waiting {delay}s)...")
+                            time.sleep(delay)
+                            
+                            try:
+                                # Retry with same payload
+                                emergency_resp = requests.post(self.base_url, headers=headers, json=payload, timeout=timeout_duration)
+                                
+                                if emergency_resp.status_code == 200:
+                                    emergency_data = emergency_resp.json()
+                                    emergency_msg = emergency_data.get('choices', [{}])[0].get('message', {})
+                                    emergency_content = emergency_msg.get('content', '') or ''
+                                    emergency_reasoning = emergency_msg.get('reasoning', '') or ''
+                                    
+                                    if emergency_content or emergency_reasoning:
+                                        print(f"   ✅ Retry {attempt} succeeded: content={len(emergency_content)} chars, reasoning={len(emergency_reasoning)} chars")
+                                        text_response = emergency_content
+                                        reasoning_text = emergency_reasoning
+                                        response_data = emergency_data
+                                        
+                                        # If we got reasoning but no content, try to extract JSON from reasoning
+                                        if not text_response and reasoning_text:
+                                            start_r = reasoning_text.find('{')
+                                            end_r = reasoning_text.rfind('}') + 1
+                                            if start_r >= 0 and end_r > start_r:
+                                                try:
+                                                    extracted_data = json.loads(reasoning_text[start_r:end_r])
+                                                    print(f"   ✅ JSON extracted from reasoning on retry {attempt}")
+                                                    return extracted_data, response_data
+                                                except json.JSONDecodeError:
+                                                    try:
+                                                        extracted_data = json.loads(self.repair_json(reasoning_text[start_r:end_r]))
+                                                        print(f"   ✅ JSON repaired from reasoning on retry {attempt}")
+                                                        return extracted_data, response_data
+                                                    except json.JSONDecodeError:
+                                                        pass
+                                        
+                                        # If we got content, break and continue to normal parsing
+                                        if text_response:
+                                            break
+                                    else:
+                                        print(f"   ❌ Retry {attempt} returned empty response")
+                                else:
+                                    print(f"   ❌ Retry {attempt} failed with status {emergency_resp.status_code}")
+                                    
+                            except Exception as emergency_err:
+                                print(f"   ❌ Retry {attempt} exception: {emergency_err}")
+                        
+                        # If still empty after all retries, fail
+                        if not text_response and not reasoning_text:
+                            print(f"❌ All {len(retry_delays)} emergency retries failed — model consistently returns empty")
+                            print(f"⚠️  This may indicate:")
+                            print(f"   1. API rate limiting or temporary outage")
+                            print(f"   2. Image too large/complex for model")
+                            print(f"   3. Prompt causing model to hang")
+                            return {'error': 'Model returned empty response after 3 retries'}, response_data
                 
                 print(f"📄 Response length: {len(text_response)} characters")
                 
@@ -563,15 +746,15 @@ class OpenRouterClient:
         pass_metadata = {}
         
         # Pass 1a: Header fields
-        print("\n📋 Pass 1a: Extracting header fields...")
+        print("\n📋 Pass 1a: Extracting header fields (Flash)...")
         header_system, header_user = get_header_prompt()
         
-        header_data, header_response = self.extract_invoice(
+        header_data, header_response = self.extract_invoice_fast(
             image,
             header_system,
             header_user,
             temperature=temperature,
-            max_tokens=4000   # Header: 12 fields; 4000 gives full reasoning headroom
+            max_tokens=4000,
         )
         
         if 'error' in header_data:
@@ -589,15 +772,15 @@ class OpenRouterClient:
         print(f"✅ Pass 1a complete: {len(header_data)} header fields extracted")
         
         # Pass 1b: Totals fields
-        print("\n💰 Pass 1b: Extracting totals fields...")
+        print("\n💰 Pass 1b: Extracting totals fields (Flash)...")
         totals_system, totals_user = get_totals_prompt()
         
-        totals_data, totals_response = self.extract_invoice(
+        totals_data, totals_response = self.extract_invoice_fast(
             image,
             totals_system,
             totals_user,
             temperature=temperature,
-            max_tokens=6000   # Totals: reasoning on amounts/rates needs space
+            max_tokens=6000,
         )
         
         if 'error' in totals_data:
@@ -629,8 +812,9 @@ class OpenRouterClient:
             items_system,
             items_user_with_context,
             temperature=temperature,
-            max_tokens=16000  # Items pass: each item ~150-200 tokens; 16000 covers 60+ items
+            max_tokens=16000,  # Items pass: each item ~150-200 tokens; 16000 covers 60+ items
                               # reasoning excluded via exclude=True — full budget for JSON output
+            use_reasoning=True  # ✅ CRITICAL: Items pass needs character-level accuracy for batch codes (W/V, M/N, etc.)
         )
         
         if 'error' in items_data:
@@ -647,14 +831,38 @@ class OpenRouterClient:
             'response': items_response
         }
         print(f"✅ Pass 2 complete: {len(merged_data['items'])} items extracted")
-        
+
+        # ── Pass 3: Zoom-in batch recheck ────────────────────────────────────
+        # For each item, crop its row from the original image at 3x zoom and
+        # re-read Batch / item_code / description with the PRIMARY model.
+        # This eliminates W/V, M/N, J/1 character errors that occur when the
+        # model reads tiny batch text in the full-page view.
+        recheck_enabled = os.getenv('BATCH_RECHECK_ENABLED', 'true').lower() == 'true'
+        if recheck_enabled and merged_data['items']:
+            try:
+                merged_data['items'] = self.extract_batch_recheck(
+                    original_image = image if not isinstance(image, list) else image[0],
+                    items          = merged_data['items'],
+                    zoom_factor    = float(os.getenv('BATCH_RECHECK_ZOOM', '3.0')),
+                    enabled        = True,
+                )
+                pass_metadata['pass_3_recheck'] = {
+                    'items_rechecked': len(merged_data['items'])
+                }
+            except Exception as recheck_err:
+                print(f"[recheck] Non-fatal error — skipping recheck: {recheck_err}")
+        else:
+            reason = "disabled via BATCH_RECHECK_ENABLED=false" if not recheck_enabled else "no items"
+            print(f"[recheck] Skipped ({reason})")
+        # ─────────────────────────────────────────────────────────────────────
+
         print("\n" + "="*80)
         print(f"✅ TWO-PASS EXTRACTION COMPLETE")
         print(f"   Header fields: {pass_metadata['pass_1a']['fields_extracted']}")
         print(f"   Totals fields: {pass_metadata['pass_1b']['fields_extracted']}")
         print(f"   Line items: {pass_metadata['pass_2']['items_extracted']}")
         print("="*80 + "\n")
-        
+
         return merged_data, pass_metadata
 
     @staticmethod
@@ -951,7 +1159,7 @@ class OpenRouterClient:
             + header_user
         )
 
-        header_data, header_response = self.extract_invoice(
+        header_data, header_response = self.extract_invoice_fast(
             unique_images,  # ← Send ALL pages
             header_system,
             header_user_multipage,
@@ -981,7 +1189,7 @@ class OpenRouterClient:
             + totals_user
         )
         
-        totals_data, totals_response = self.extract_invoice(
+        totals_data, totals_response = self.extract_invoice_fast(
             unique_images,  # ← Send ALL pages
             totals_system,
             totals_user_multipage,
@@ -1204,8 +1412,27 @@ class OpenRouterClient:
         all_items = deduped_items
 
         # ── Write final items and summary ─────────────────────────
-        print(f"\n🔍 Finalising items...")
+        print(f"\n[multipage] Finalising items...")
         unique_items = all_items
+
+        # ── Zoom-in batch recheck ─────────────────────────────────
+        # Run recheck against page_1 (the first unique page, which normally
+        # contains the item table). For multi-page invoices the recheck uses
+        # equal-height fallback slicing when boundary detection is uncertain.
+        recheck_enabled = os.getenv('BATCH_RECHECK_ENABLED', 'true').lower() == 'true'
+        if recheck_enabled and unique_items:
+            try:
+                unique_items = self.extract_batch_recheck(
+                    original_image = page_1,
+                    items          = unique_items,
+                    zoom_factor    = float(os.getenv('BATCH_RECHECK_ZOOM', '3.0')),
+                    enabled        = True,
+                )
+            except Exception as recheck_err:
+                print(f"[recheck] Non-fatal error — skipping: {recheck_err}")
+        else:
+            reason = "disabled via BATCH_RECHECK_ENABLED=false" if not recheck_enabled else "no items"
+            print(f"[recheck] Skipped ({reason})")
 
         merged_data['items'] = unique_items
         pass_metadata['pass_3_items'] = {
@@ -1215,7 +1442,10 @@ class OpenRouterClient:
             'pages_used': n_unique
         }
 
-        print(f"✅ Items finalised: {len(all_items) + duplicate_count} extracted, {len(unique_items)} unique, {duplicate_count} duplicates removed")
+        print(f"[multipage] Items finalised: "
+              f"{len(all_items) + duplicate_count} extracted, "
+              f"{len(unique_items)} unique, "
+              f"{duplicate_count} duplicates removed")
 
         print("\n" + "="*80)
         print(f"✅ EXTRACTION COMPLETE — Per-page strategy")
@@ -1234,6 +1464,203 @@ class OpenRouterClient:
         }
         
         return merged_data, metadata
+
+    @traceable(name="model_batch_recheck", tags=["model", "recheck", "zoom"])
+    def extract_batch_recheck(
+        self,
+        original_image: Image.Image,
+        items: list[dict],
+        zoom_factor: float = 3.0,
+        enabled: bool = True,
+    ) -> list[dict]:
+        """
+        Adversarial double-read recheck pass for 100% batch code accuracy.
+
+        Architecture
+        ────────────
+        For each item row (zoomed crop):
+
+          Read A  →  Flash, temperature 0.0  (deterministic)
+          Read B  →  Flash, temperature 0.6  (forced variation)
+
+          If A == B  →  Accept. Done for this item. (No Plus call needed.)
+          If A != B  →  Plus arbitration pass with reasoning ON.
+                        Plus sees both candidates + the image and decides.
+
+        This means Plus only fires for genuinely ambiguous characters (W/V, M/N
+        etc.) where the two cheap reads disagree. Clear characters cost 2 Flash
+        calls only. Ambiguous ones cost 2 Flash + 1 Plus.
+
+        The result: model agreement = already correct, disagreement = escalated
+        to the most capable model with full reasoning. Near-100% accuracy.
+
+        Args:
+            original_image : Full preprocessed page image (single page).
+            items          : Item dicts from the main extraction pass.
+            zoom_factor    : Upscale factor for row crops (default 3.0).
+            enabled        : False to skip entirely.
+
+        Returns:
+            Updated items list with Batch / item_code / description patched.
+        """
+        from schema import get_batch_recheck_prompt, get_batch_arbitration_prompt
+        from preprocessing import crop_item_rows
+
+        if not enabled or not items:
+            return items
+
+        n_items = len(items)
+        print(f"\n{'='*80}")
+        print(f"ADVERSARIAL DOUBLE-READ RECHECK  ({n_items} items, {zoom_factor}x zoom)")
+        print(f"Flash x2 per item  |  Plus arbitration only on disagreement")
+        print(f"{'='*80}")
+
+        # ── Crop one row per item ────────────────────────────────────────────
+        row_crops = crop_item_rows(original_image, n_items=n_items, zoom_factor=zoom_factor)
+        if len(row_crops) != n_items:
+            print(f"   [recheck] crop count {len(row_crops)} != {n_items} — padding")
+            while len(row_crops) < n_items:
+                row_crops.append(original_image)
+            row_crops = row_crops[:n_items]
+
+        agreed = 0
+        arbitrated = 0
+        corrections = 0
+
+        for idx, (item, crop) in enumerate(zip(items, row_crops)):
+            prior_desc  = str(item.get('description') or '')
+            prior_batch = str(item.get('Batch')       or '')
+            prior_code  = '' if item.get('item_code') is None else str(item.get('item_code'))
+
+            # ── Read A: Flash, temperature 0.0 (deterministic) ───────────────
+            sys_a, usr_a = get_batch_recheck_prompt(
+                prior_description=prior_desc,
+                prior_batch=prior_batch,
+                prior_code=prior_code,
+                read_index=0,
+            )
+            result_a, _ = self._call_model(
+                crop, sys_a, usr_a,
+                temperature=0.0,
+                max_tokens=300,
+                use_reasoning=False,          # Flash: no reasoning, fast
+                model_override=self.FAST_MODEL,
+                api_key_override=self.fast_api_key,
+            )
+
+            # ── Read B: Flash, temperature 0.6 (forced variation) ────────────
+            sys_b, usr_b = get_batch_recheck_prompt(
+                prior_description=prior_desc,
+                prior_batch=prior_batch,
+                prior_code=prior_code,
+                read_index=1,
+            )
+            result_b, _ = self._call_model(
+                crop, sys_b, usr_b,
+                temperature=0.6,
+                max_tokens=300,
+                use_reasoning=False,          # Flash: no reasoning, fast
+                model_override=self.FAST_MODEL,
+                api_key_override=self.fast_api_key,
+            )
+
+            # Handle API errors on either read
+            if 'error' in result_a and 'error' in result_b:
+                print(f"   Item {idx+1}: both reads failed — keeping original")
+                continue
+            if 'error' in result_a:
+                result_a = result_b
+            if 'error' in result_b:
+                result_b = result_a
+
+            batch_a = (result_a.get('Batch') or '').strip().upper()
+            batch_b = (result_b.get('Batch') or '').strip().upper()
+            code_a  = (result_a.get('item_code') or '').strip()
+            code_b  = (result_b.get('item_code') or '').strip()
+            desc_a  = (result_a.get('description') or '').strip()
+            desc_b  = (result_b.get('description') or '').strip()
+
+            # ── Compare: do both reads agree? ────────────────────────────────
+            batch_agree = (batch_a == batch_b) or (not batch_a and not batch_b)
+            code_agree  = (code_a  == code_b)
+            desc_agree  = (desc_a  == desc_b) or (not desc_a and not desc_b)
+
+            if batch_agree and code_agree and desc_agree:
+                # Agreement — accept read A as authoritative
+                agreed += 1
+                final_batch = batch_a or prior_batch
+                final_code  = code_a
+                final_desc  = desc_a or prior_desc
+                print(f"   Item {idx+1} AGREED   batch={final_batch}  "
+                      f"[{prior_desc[:30]}]")
+            else:
+                # Disagreement — escalate to Plus arbitration
+                arbitrated += 1
+                disagreements = []
+                if not batch_agree:
+                    disagreements.append(f"Batch: A={batch_a!r} B={batch_b!r}")
+                if not code_agree:
+                    disagreements.append(f"code: A={code_a!r} B={code_b!r}")
+                if not desc_agree:
+                    disagreements.append(f"desc: A={desc_a[:25]!r} B={desc_b[:25]!r}")
+                print(f"   Item {idx+1} DISAGREE  {' | '.join(disagreements)}")
+                print(f"   Item {idx+1}  --> escalating to Plus arbitration...")
+
+                # Arbitration prompt: show Plus both candidates + the image
+                # Focus on the most important disagreement (Batch first)
+                primary_field    = "Batch"     if not batch_agree else "item_code"
+                candidate_a_val  = batch_a     if not batch_agree else code_a
+                candidate_b_val  = batch_b     if not batch_agree else code_b
+
+                sys_arb, usr_arb = get_batch_arbitration_prompt(
+                    candidate_a=candidate_a_val,
+                    candidate_b=candidate_b_val,
+                    field=primary_field,
+                    prior_description=prior_desc,
+                )
+                result_arb, _ = self._call_model(
+                    crop, sys_arb, usr_arb,
+                    temperature=0.0,
+                    max_tokens=400,
+                    use_reasoning=True,          # Plus WITH reasoning — full power
+                    model_override=None,         # PRIMARY model (Plus)
+                    api_key_override=None,
+                )
+
+                if 'error' in result_arb:
+                    # Arbitration failed — fall back to read A
+                    print(f"   Item {idx+1}  arbitration failed — using read A")
+                    final_batch = batch_a or prior_batch
+                    final_code  = code_a
+                    final_desc  = desc_a or prior_desc
+                else:
+                    reason = result_arb.get('arbitration_reason', '')
+                    final_batch = (result_arb.get('Batch') or batch_a or prior_batch).strip().upper()
+                    final_code  = (result_arb.get('item_code') or code_a or '').strip()
+                    final_desc  = (result_arb.get('description') or desc_a or prior_desc).strip()
+                    print(f"   Item {idx+1}  arbitrated: batch={final_batch}  "
+                          f"reason: {reason[:60]}")
+
+            # ── Apply final values to item ────────────────────────────────────
+            changed = []
+            if final_batch and final_batch != prior_batch.upper():
+                item['Batch'] = final_batch
+                changed.append(f"Batch {prior_batch!r} -> {final_batch!r}")
+            if final_code is not None and final_code != prior_code:
+                item['item_code'] = final_code
+                changed.append(f"code {prior_code!r} -> {final_code!r}")
+            if final_desc and final_desc != prior_desc:
+                item['description'] = final_desc
+                changed.append(f"desc corrected")
+
+            if changed:
+                corrections += 1
+                print(f"   Item {idx+1} CORRECTED  {' | '.join(changed)}")
+
+        print(f"\n[recheck] {n_items} items: {agreed} agreed, "
+              f"{arbitrated} arbitrated, {corrections} corrected")
+        print(f"{'='*80}\n")
+        return items
 
     @traceable(name="model_verify_extraction", tags=["model", "verification"], metadata={"model": "qwen3.7-plus"})
     def verify_extraction(
