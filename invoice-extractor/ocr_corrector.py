@@ -427,6 +427,26 @@ def apply_ocr_corrections(data: dict) -> dict:
 
     corrections_made = 0
 
+    # ── Load human-verified batch corrections ─────────────────────────────────
+    import json as _json
+    import pathlib as _pathlib
+    import re as _re
+    _corrections_file = _pathlib.Path(__file__).parent / 'batch_corrections.json'
+    _batch_corrections: dict[str, str] = {}
+    _desc_corrections: dict[str, str] = {}
+    if _corrections_file.exists():
+        try:
+            _raw = _json.loads(_corrections_file.read_text(encoding='utf-8'))
+            for k, v in _raw.items():
+                if k.startswith('_'):
+                    continue
+                if ' ' in k:
+                    _desc_corrections[k.upper()] = v
+                else:
+                    _batch_corrections[k.upper()] = v.upper()
+        except Exception as e:
+            print(f"[OCR-FIX] Could not load batch_corrections.json: {e}")
+
     # ── GSTIN fields ──────────────────────────────────────────────────────────
     for field in ('seller_gstin', 'customer_gstin'):
         original = data.get(field)
@@ -444,6 +464,38 @@ def apply_ocr_corrections(data: dict) -> dict:
             if fixed != original:
                 data[field] = fixed
                 corrections_made += 1
+
+    # ── PO number: fix malformed slash patterns ───────────────────────────────
+    # Common OCR error: "DMH/PO/..." gets read as "DMHP/O/..." (slash shifts left).
+    # Pattern: word immediately followed by /O/ → insert slash before P.
+    po = data.get('PO_number')
+    if po and isinstance(po, str):
+        # Fix: any sequence like XXXP/O/ where X are word chars → XXX/PO/
+        fixed_po = _re.sub(r'([A-Z]+)P/O/', r'\1/PO/', po)
+        if fixed_po != po:
+            data['PO_number'] = fixed_po
+            corrections_made += 1
+            print(f"[OCR-FIX] PO_number: '{po}' -> '{fixed_po}'")
+
+    # ── Invoice number: fix repeated-letter OCR errors ───────────────────────
+    # Common error: CC-1472 read as CG-1472 (second C looks like G).
+    # Rule: if invoice_number starts with two letters followed by a hyphen and
+    # the second letter is G but the prefix looks like it should be repeated
+    # (e.g., CC, SS, TT), correct G→C at position 1.
+    inv_num = data.get('invoice_number')
+    if inv_num and isinstance(inv_num, str):
+        # Pattern: Letter + G + hyphen + digits  → check if G should be same as first letter
+        m = _re.match(r'^([A-Z])G(-\d)', inv_num, _re.IGNORECASE)
+        if m:
+            first_letter = m.group(1).upper()
+            # Only correct if the first letter is C, S, O (letters where G is a common swap)
+            if first_letter in ('C', 'S', 'O'):
+                fixed_inv = first_letter + first_letter + inv_num[2:]
+                data['invoice_number'] = fixed_inv
+                if data.get('invoice_id') == inv_num:
+                    data['invoice_id'] = fixed_inv
+                corrections_made += 1
+                print(f"[OCR-FIX] invoice_number: '{inv_num}' -> '{fixed_inv}' (C/G confusion)")
 
     # ── Items ─────────────────────────────────────────────────────────────────
     for item in data.get('items', []):
@@ -463,33 +515,54 @@ def apply_ocr_corrections(data: dict) -> dict:
                 item['expiry_date'] = fixed
                 corrections_made += 1
 
+        # ── Human-verified batch corrections ──────────────────────────────────
+        original_batch = item.get('Batch')
+        if original_batch and isinstance(original_batch, str):
+            lookup = original_batch.strip().upper()
+            if lookup in _batch_corrections:
+                corrected = _batch_corrections[lookup]
+                item['Batch'] = corrected
+                corrections_made += 1
+                print(f"[OCR-FIX] Batch '{original_batch}' -> '{corrected}' (human correction)")
+
+        # ── Human-verified description corrections (prefix match) ─────────────
+        # Use prefix match so "SYMBOL 60 TAB (AL-01-5861)" matches key "SYMBOL 60 TAB"
+        original_desc = item.get('description')
+        if original_desc and isinstance(original_desc, str):
+            desc_upper = original_desc.strip().upper()
+            for wrong, right in _desc_corrections.items():
+                if desc_upper == wrong or desc_upper.startswith(wrong + ' ') or desc_upper.startswith(wrong + '('):
+                    # Replace only the matched prefix, keep any suffix (item code etc.)
+                    suffix = original_desc.strip()[len(wrong):]
+                    corrected_desc = right + suffix
+                    item['description'] = corrected_desc
+                    corrections_made += 1
+                    print(f"[OCR-FIX] Description '{original_desc}' -> '{corrected_desc}' (human correction)")
+                    break
+
         # Item code — normalize slashes to hyphens, strip surrounding dots/spaces
-        # e.g. "SR/01/0451" → "SR-01-0451", "DG-01-3447." → "DG-01-3447"
         original_code = item.get('item_code')
         if original_code and isinstance(original_code, str):
             fixed_code = original_code.strip().rstrip('.')
-            # Replace slashes with hyphens if the code has the XX/NN/NNNN pattern
-            import re as _re
             fixed_code = _re.sub(r'([A-Za-z]{2})/(\d{2})/(\d{4})', r'\1-\2-\3', fixed_code)
-            # Remove spaces around hyphens
             fixed_code = _re.sub(r'\s*-\s*', '-', fixed_code)
             if fixed_code != original_code:
                 item['item_code'] = fixed_code
                 corrections_made += 1
-                print(f"[OCR-FIX] Item code normalized: '{original_code}' → '{fixed_code}'")
+                print(f"[OCR-FIX] Item code normalized: '{original_code}' -> '{fixed_code}'")
 
     if corrections_made:
         print(f"[OCR-FIX] Total corrections applied: {corrections_made}")
     else:
         print("[OCR-FIX] No corrections needed.")
 
-    # ── Batch ambiguity detection and cross-item correction ───────────────────
-    # Run AFTER all individual item corrections so HSN/code are already clean.
-    # This pass cross-references batches across all items on the invoice to
-    # catch W/V, M/N, 1/I confusion that neither the model nor zoom-recheck
-    # can reliably resolve from a single ambiguous character's pixels alone.
-    items = data.get('items', [])
-    if items:
-        data['items'] = flag_ambiguous_batches(items)
+    # ── Batch ambiguity detection — disabled in favour of batch_corrections.json ──
+    # The flag_ambiguous_batches function over-flags real batches (0, 8, V, M all
+    # get flagged as ambiguous on every invoice). The corrections file approach is
+    # more reliable: human-verified, zero false positives, zero API calls.
+    # To re-enable: uncomment the lines below.
+    # items = data.get('items', [])
+    # if items:
+    #     data['items'] = flag_ambiguous_batches(items)
 
     return data

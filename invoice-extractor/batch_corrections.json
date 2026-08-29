@@ -1,0 +1,14 @@
+{
+  "_comment": "Human-verified batch code corrections. Add entries as you find OCR errors.",
+  "_format": "wrong_value_uppercase: correct_value_uppercase",
+  "_instructions": [
+    "When the model returns a wrong batch code, add it here.",
+    "Key = what the model returns (uppercase), Value = what the invoice actually shows.",
+    "This file is applied deterministically after extraction — zero API calls, 100% accurate.",
+    "Example: model returns ABVG0002, invoice shows ABWG0002 → add 'ABVG0002': 'ABWG0002'"
+  ],
+  "ABVG0002": "ABWG0002",
+  "ENV261280A": "EMV261280A",
+  "RFJ826001": "RF1826001",
+  "SYMBOL 60 TAB": "SYMBAL 60 TAB"
+}

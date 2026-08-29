@@ -823,23 +823,25 @@ def extract_invoice():
                                     item[field] = None
             
             # 5. Remove internal and deprecated fields
-            internal_fields = ['_gst_source', '_gst_calculation_metadata',
-                              '_validation_warnings', '_validation_errors',
-                              '_gst_rate_corrected', '_invoice_review_reasons']
+            internal_fields = [
+                '_gst_source', '_gst_calculation_metadata',
+                '_validation_warnings', '_validation_errors',
+                '_gst_rate_corrected', '_invoice_review_reasons',
+            ]
             deprecated_fields = ['seller_DL_Number', 'customer_DL_Number']
 
-            for field in internal_fields + deprecated_fields:
-                if field in data:
-                    del data[field]
+            # Remove all underscore-prefixed internal fields from top-level data
+            keys_to_delete = [k for k in list(data.keys())
+                               if k.startswith('_') or k in deprecated_fields]
+            for k in keys_to_delete:
+                del data[k]
 
-            # Also remove from items
-            # Remove review flags from items as client doesn't need them in output
-            deprecated_item_fields = ['mfgr_code', '_gst_source', '_needs_review', '_review_reasons']
+            # Remove all internal fields from items
             if 'items' in data and isinstance(data['items'], list):
                 for item in data['items']:
-                    for field in internal_fields + deprecated_item_fields:
-                        if field in item:
-                            del item[field]
+                    item_keys_to_delete = [k for k in list(item.keys()) if k.startswith('_')]
+                    for k in item_keys_to_delete:
+                        del item[k]
             
             return data
         

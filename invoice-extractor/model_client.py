@@ -832,11 +832,9 @@ class OpenRouterClient:
         }
         print(f"✅ Pass 2 complete: {len(merged_data['items'])} items extracted")
 
-        # ── Pass 3: Zoom-in batch recheck ────────────────────────────────────
-        # For each item, crop its row from the original image at 3x zoom and
-        # re-read Batch / item_code / description with the PRIMARY model.
-        # This eliminates W/V, M/N, J/1 character errors that occur when the
-        # model reads tiny batch text in the full-page view.
+        # ── Pass 3: Batched batch recheck ────────────────────────────────────
+        # Crop the full table region, send to Flash x2 + Plus (if needed).
+        # Total: 3 API calls regardless of item count.
         recheck_enabled = os.getenv('BATCH_RECHECK_ENABLED', 'true').lower() == 'true'
         if recheck_enabled and merged_data['items']:
             try:
@@ -1228,25 +1226,36 @@ class OpenRouterClient:
             # page was lets it correctly associate orphan metadata.
             if pg_idx > 0 and last_page_last_item:
                 prev_desc  = last_page_last_item.get('description', 'unknown')
-                prev_batch = last_page_last_item.get('Batch') or 'null'
-                prev_code  = last_page_last_item.get('item_code') or 'null'
-                prev_hsn   = last_page_last_item.get('hsn_sac') or 'null'
+                prev_batch = last_page_last_item.get('Batch')      or 'null'
+                prev_code  = last_page_last_item.get('item_code')  or 'null'
+                prev_hsn   = last_page_last_item.get('hsn_sac')    or 'null'
+                prev_pack  = last_page_last_item.get('Pack')       or 'null'
+                prev_mrp   = last_page_last_item.get('MRP')        or 'null'
+                prev_exp   = last_page_last_item.get('expiry_date') or 'null'
                 continuation_hint = (
-                    f"\n⚠️ PAGE BOUNDARY CONTEXT:\n"
-                    f"The PREVIOUS page ended with this item (may be incomplete):\n"
-                    f"  Description : {prev_desc}\n"
+                    f"\n⚠️⚠️⚠️ PAGE BOUNDARY — CRITICAL RULE:\n"
+                    f"The PREVIOUS page ended with item '{prev_desc}' which may be INCOMPLETE.\n"
+                    f"Known data for that item so far:\n"
                     f"  Batch       : {prev_batch}\n"
+                    f"  Expiry      : {prev_exp}\n"
                     f"  Item Code   : {prev_code}\n"
-                    f"  HSN         : {prev_hsn}\n\n"
-                    f"RULE: If this page begins with ONLY:\n"
-                    f"  - 'Batch & Expiry : ...' line\n"
-                    f"  - 'Item Code : ...' line\n"
-                    f"  ...with NO item number or description before them,\n"
-                    f"  these values belong to the item above ({prev_desc}).\n"
-                    f"  DO NOT attach them to the first item on THIS page.\n"
-                    f"  Return them as a continuation object:\n"
-                    f"  {{\"_continuation_for_previous_page\": true, "
-                    f"\"Batch\": \"...\", \"expiry_date\": \"...\", \"item_code\": \"...\"}}\n\n"
+                    f"  HSN         : {prev_hsn}\n"
+                    f"  Pack        : {prev_pack}\n"
+                    f"  MRP         : {prev_mrp}\n\n"
+                    f"LOOK AT THE TOP OF THIS PAGE NOW.\n"
+                    f"If this page starts with lines like:\n"
+                    f"  'Batch & Expiry: 346YL8, 11-Oct-30'\n"
+                    f"  'Item Code: SR-06-1905'\n"
+                    f"  OR a sub-row under the previous item number\n"
+                    f"  ...WITHOUT a new Sr.No. or product description\n"
+                    f"THEN: these lines belong to item '{prev_desc}' from the previous page.\n"
+                    f"MANDATORY: Return them as a continuation object FIRST:\n"
+                    f"  {{\"_continuation_for_previous_page\": true,\n"
+                    f"   \"Batch\": \"...\", \"expiry_date\": \"...\",\n"
+                    f"   \"item_code\": \"...\", \"hsn_sac\": \"...\",\n"
+                    f"   \"Pack\": \"...\", \"MRP\": ...}}\n"
+                    f"DO NOT attach these values to the FIRST item on this page.\n"
+                    f"DO NOT skip them or leave them out of the JSON.\n\n"
                 )
                 items_user_with_context = base_items_prompt + continuation_hint
                 print(f"   Continuation hint injected for prev item: {prev_desc[:40]}")
@@ -1266,10 +1275,20 @@ class OpenRouterClient:
 
             page_items = page_items_data.get('items', [])
             print(f"   ✅ Page {pg_idx + 1}: {len(page_items)} items extracted")
+            # Tag every item with its source page index so the recheck pass
+            # can later route each item to the correct page image.
+            for it in page_items:
+                it['_source_page_idx'] = pg_idx
             all_items.extend(page_items)
 
-            # Track last real item from this page for next page's context
-            real_items = [it for it in page_items if it.get('description') and it.get('quantity')]
+            # Track last real item from this page for next page's context.
+            # Relaxed: accept items that have description OR price (not qty required).
+            # An item whose quantity is on the next page still needs its context injected.
+            real_items = [
+                it for it in page_items
+                if it.get('description') and str(it.get('description', '')).strip()
+                and str(it.get('description', '')).strip() not in ('?', 'null', 'none', 'N/A')
+            ]
             if real_items:
                 last_page_last_item = real_items[-1]
 
@@ -1298,32 +1317,106 @@ class OpenRouterClient:
             return has_desc and (has_qty or has_price)
 
         def _is_continuation(item: dict) -> bool:
-            """True if row carries ONLY batch/expiry/item_code — tail of a split item."""
-            # Explicit flag set when model was told to return a continuation object
+            """True if row is a split-item tail — carries metadata but no description."""
+            # Explicit flag set by model when given the continuation hint
             if item.get('_continuation_for_previous_page'):
                 return True
-            has_meta = any([
-                item.get('Batch')       and str(item.get('Batch', '')).strip(),
-                item.get('expiry_date') and str(item.get('expiry_date', '')).strip(),
-                item.get('item_code')   and str(item.get('item_code', '')).strip(),
-            ])
-            return has_meta and not _has_real_data(item)
+
+            desc = str(item.get('description') or '').strip()
+            has_desc = bool(desc) and desc not in ('?', 'null', 'none', 'N/A')
+
+            # If there is NO description, and there IS any split-field metadata
+            # → this is definitely a continuation row regardless of price/qty fields
+            if not has_desc:
+                has_meta = any([
+                    item.get('Batch')       and str(item.get('Batch', '')).strip(),
+                    item.get('expiry_date') and str(item.get('expiry_date', '')).strip(),
+                    item.get('item_code')   and str(item.get('item_code', '')).strip(),
+                    item.get('hsn_sac')     and str(item.get('hsn_sac', '')).strip(),
+                    item.get('Pack')        and str(item.get('Pack', '')).strip(),
+                    item.get('MRP')         is not None,
+                ])
+                if has_meta:
+                    return True
+
+            return False
+
+        # Fields that can legitimately be split across a page boundary
+        _CONTINUATION_FIELDS = (
+            'Batch', 'expiry_date', 'item_code',
+            'hsn_sac', 'Pack', 'MRP',
+        )
 
         merged_items: list[dict] = []
         for item in all_items:
             if _is_continuation(item) and merged_items:
                 last = merged_items[-1]
                 patched = False
-                for field in ('Batch', 'expiry_date', 'item_code'):
-                    if item.get(field) and not last.get(field):
-                        last[field] = item[field]
+                for field in _CONTINUATION_FIELDS:
+                    val = item.get(field)
+                    # Patch only when continuation row has a value AND prior item lacks it
+                    if val is not None and str(val).strip() and not last.get(field):
+                        last[field] = val
                         patched = True
                 if patched:
-                    print(f"   🔗 Continuation row merged into: {last.get('description', '')[:45]}")
+                    print(f"   Continuation row merged into: {last.get('description', '')[:45]}")
             else:
                 merged_items.append(item)
 
         all_items = merged_items
+
+        # ════════════════════════════════════════════════════════════
+        # STEP 1b: FORWARD-LOOK ORPHAN PATCH
+        # ────────────────────────────────────────────────────────────
+        # Safety net for cases where the model returned the continuation
+        # data as a full (but mostly null) item rather than as a
+        # no-description row. Pattern:
+        #
+        #   Item i   : has description + qty, but batch=null, expiry=null
+        #   Item i+1 : has batch + expiry, but NO description (or same desc)
+        #              AND was NOT caught by _is_continuation above
+        #
+        # This covers the edge case: model returns page-2 metadata as a
+        # separate item with description="" or description copied from prior.
+        # ════════════════════════════════════════════════════════════
+        def _item_missing_meta(item: dict) -> bool:
+            """True if item lacks batch AND expiry AND item_code."""
+            no_batch  = not str(item.get('Batch') or '').strip()
+            no_expiry = not str(item.get('expiry_date') or '').strip()
+            no_code   = not str(item.get('item_code') or '').strip()
+            return no_batch and no_expiry and no_code
+
+        def _item_is_meta_only(item: dict) -> bool:
+            """True if item has no meaningful description but has batch/expiry."""
+            desc = str(item.get('description') or '').strip()
+            has_desc = bool(desc) and desc not in ('?', 'null', 'none', 'N/A', '')
+            has_batch  = bool(str(item.get('Batch') or '').strip())
+            has_expiry = bool(str(item.get('expiry_date') or '').strip())
+            has_code   = bool(str(item.get('item_code') or '').strip())
+            return (not has_desc) and (has_batch or has_expiry or has_code)
+
+        patched_indices: set = set()
+        for i in range(len(all_items) - 1):
+            item      = all_items[i]
+            next_item = all_items[i + 1]
+            if (i not in patched_indices
+                    and _item_missing_meta(item)
+                    and _item_is_meta_only(next_item)):
+                # Patch metadata from next item into this one
+                for field in _CONTINUATION_FIELDS:
+                    val = next_item.get(field)
+                    if val is not None and str(val).strip() and not item.get(field):
+                        item[field] = val
+                patched_indices.add(i + 1)   # mark next item for removal
+                desc_preview = item.get('description', '')[:40]
+                print(f"   Forward-look patch: '{desc_preview}' "
+                      f"<- batch={item.get('Batch')} expiry={item.get('expiry_date')}")
+
+        # Remove items that were absorbed into their predecessor
+        if patched_indices:
+            all_items = [it for idx, it in enumerate(all_items)
+                         if idx not in patched_indices]
+            print(f"   Forward-look: {len(patched_indices)} orphan row(s) absorbed")
 
         # ════════════════════════════════════════════════════════════
         # STEP 2: AGGRESSIVE DEDUPLICATION — remove replica items
@@ -1415,24 +1508,55 @@ class OpenRouterClient:
         print(f"\n[multipage] Finalising items...")
         unique_items = all_items
 
-        # ── Zoom-in batch recheck ─────────────────────────────────
-        # Run recheck against page_1 (the first unique page, which normally
-        # contains the item table). For multi-page invoices the recheck uses
-        # equal-height fallback slicing when boundary detection is uncertain.
+        # ── Per-page batch recheck ────────────────────────────────
+        # Each item was tagged with _source_page_idx during extraction.
+        # Group items by source page and run one batched recheck call per page
+        # (2 Flash + max 1 Plus per page) against the CORRECT page image.
+        # This is still O(pages) calls, not O(items) calls.
         recheck_enabled = os.getenv('BATCH_RECHECK_ENABLED', 'true').lower() == 'true'
         if recheck_enabled and unique_items:
             try:
-                unique_items = self.extract_batch_recheck(
-                    original_image = page_1,
-                    items          = unique_items,
-                    zoom_factor    = float(os.getenv('BATCH_RECHECK_ZOOM', '3.0')),
-                    enabled        = True,
-                )
+                zoom = float(os.getenv('BATCH_RECHECK_ZOOM', '3.0'))
+
+                # Group items by source page
+                from collections import defaultdict
+                page_groups: dict[int, list[int]] = defaultdict(list)
+                for item_idx, item in enumerate(unique_items):
+                    src_pg = item.get('_source_page_idx', 0)
+                    page_groups[src_pg].append(item_idx)
+
+                print(f"[recheck] Per-page routing: "
+                      f"{len(page_groups)} page(s), "
+                      f"{len(unique_items)} items total")
+
+                for pg_idx in sorted(page_groups.keys()):
+                    idxs = page_groups[pg_idx]
+                    page_img = unique_images[pg_idx] if pg_idx < len(unique_images) else page_1
+                    page_slice = [unique_items[i] for i in idxs]
+
+                    print(f"   Page {pg_idx + 1}: rechecking {len(page_slice)} items "
+                          f"({page_img.width}x{page_img.height})")
+
+                    corrected_slice = self.extract_batch_recheck(
+                        original_image=page_img,
+                        items=page_slice,
+                        zoom_factor=zoom,
+                        enabled=True,
+                    )
+
+                    # Write corrected items back into unique_items at original positions
+                    for list_pos, item_idx in enumerate(idxs):
+                        unique_items[item_idx] = corrected_slice[list_pos]
+
             except Exception as recheck_err:
                 print(f"[recheck] Non-fatal error — skipping: {recheck_err}")
         else:
             reason = "disabled via BATCH_RECHECK_ENABLED=false" if not recheck_enabled else "no items"
             print(f"[recheck] Skipped ({reason})")
+
+        # Strip internal routing tag before returning
+        for item in unique_items:
+            item.pop('_source_page_idx', None)
 
         merged_data['items'] = unique_items
         pass_metadata['pass_3_items'] = {
@@ -1474,191 +1598,201 @@ class OpenRouterClient:
         enabled: bool = True,
     ) -> list[dict]:
         """
-        Adversarial double-read recheck pass for 100% batch code accuracy.
+        Batched adversarial double-read recheck — 3 API calls regardless of item count.
 
         Architecture
         ────────────
-        For each item row (zoomed crop):
+        1. Crop the FULL item table region from the image (one crop, not per row).
+        2. Flash Read A  (temp=0.0) → returns {items:[{Batch,item_code,description},...]}
+        3. Flash Read B  (temp=0.6) → same format, forced variation
+        4. Per-item comparison:
+             - Agree + no W/V/M/N chars  → accept, no further calls
+             - Agree + has W/V/M/N OR disagrees → add to Plus arbitration list
+        5. If any items need arbitration: ONE Plus call with the table image +
+           list of disagreements → returns corrections for only those rows.
 
-          Read A  →  Flash, temperature 0.0  (deterministic)
-          Read B  →  Flash, temperature 0.6  (forced variation)
-
-          If A == B  →  Accept. Done for this item. (No Plus call needed.)
-          If A != B  →  Plus arbitration pass with reasoning ON.
-                        Plus sees both candidates + the image and decides.
-
-        This means Plus only fires for genuinely ambiguous characters (W/V, M/N
-        etc.) where the two cheap reads disagree. Clear characters cost 2 Flash
-        calls only. Ambiguous ones cost 2 Flash + 1 Plus.
-
-        The result: model agreement = already correct, disagreement = escalated
-        to the most capable model with full reasoning. Near-100% accuracy.
+        Total calls: 2 Flash + 0 or 1 Plus = 3 calls max for ANY invoice size.
 
         Args:
             original_image : Full preprocessed page image (single page).
             items          : Item dicts from the main extraction pass.
-            zoom_factor    : Upscale factor for row crops (default 3.0).
+            zoom_factor    : Upscale factor for the table crop (default 3.0).
             enabled        : False to skip entirely.
 
         Returns:
             Updated items list with Batch / item_code / description patched.
         """
         from schema import get_batch_recheck_prompt, get_batch_arbitration_prompt
-        from preprocessing import crop_item_rows
+        from preprocessing import extract_table_region
 
         if not enabled or not items:
             return items
 
         n_items = len(items)
         print(f"\n{'='*80}")
-        print(f"ADVERSARIAL DOUBLE-READ RECHECK  ({n_items} items, {zoom_factor}x zoom)")
-        print(f"Flash x2 per item  |  Plus arbitration only on disagreement")
+        print(f"BATCHED RECHECK  ({n_items} items)  —  2 Flash + max 1 Plus call")
         print(f"{'='*80}")
 
-        # ── Crop one row per item ────────────────────────────────────────────
-        row_crops = crop_item_rows(original_image, n_items=n_items, zoom_factor=zoom_factor)
-        if len(row_crops) != n_items:
-            print(f"   [recheck] crop count {len(row_crops)} != {n_items} — padding")
-            while len(row_crops) < n_items:
-                row_crops.append(original_image)
-            row_crops = row_crops[:n_items]
+        # ── Crop the full table region and zoom it ────────────────────────────
+        table_crop = extract_table_region(original_image, expand_ratio=1.05)
+        # Zoom: upscale so small batch characters are large
+        # Use 4x for the recheck — bigger = clearer W vs V distinction
+        effective_zoom = max(zoom_factor, 4.0)
+        zoomed_w = int(table_crop.width  * effective_zoom)
+        zoomed_h = int(table_crop.height * effective_zoom)
+        from PIL import Image as _PIL
+        table_zoomed = table_crop.resize((zoomed_w, zoomed_h), _PIL.Resampling.LANCZOS)
+        print(f"   Table crop: {table_crop.width}x{table_crop.height} "
+              f"-> zoomed {zoomed_w}x{zoomed_h} ({effective_zoom}x)")
 
-        agreed = 0
-        arbitrated = 0
-        corrections = 0
+        # ── Read A: Plus with reasoning ON (authoritative) ────────────────────
+        # Use the PRIMARY model (Plus) for the first read because:
+        # - Flash has zero published benchmarks for character accuracy
+        # - W/V ambiguity requires reasoning to resolve correctly
+        # - Plus with reasoning=True uses chain-of-thought before answering
+        sys_a, usr_a = get_batch_recheck_prompt(prior_items=items, read_index=0)
+        result_a, _ = self._call_model(
+            table_zoomed, sys_a, usr_a,
+            temperature=0.0, max_tokens=n_items * 120 + 400,
+            use_reasoning=True,              # PLUS WITH REASONING — most accurate
+            model_override=None,             # PRIMARY model (Plus)
+            api_key_override=None,
+        )
+        items_a = result_a.get('items', []) if 'error' not in result_a else []
 
-        for idx, (item, crop) in enumerate(zip(items, row_crops)):
-            prior_desc  = str(item.get('description') or '')
-            prior_batch = str(item.get('Batch')       or '')
-            prior_code  = '' if item.get('item_code') is None else str(item.get('item_code'))
+        # ── Read B: Flash cross-check (cheap disagreement detector) ──────────
+        # Flash is only used to DETECT disagreement, not as the authority.
+        # If Flash agrees with Plus → trust Plus.
+        # If Flash disagrees → Plus arbitration fires with the image again.
+        sys_b, usr_b = get_batch_recheck_prompt(prior_items=items, read_index=1)
+        result_b, _ = self._call_model(
+            table_zoomed, sys_b, usr_b,
+            temperature=0.4, max_tokens=n_items * 80 + 200,
+            use_reasoning=False,
+            model_override=self.FAST_MODEL, api_key_override=self.fast_api_key,
+        )
+        items_b = result_b.get('items', []) if 'error' not in result_b else []
 
-            # ── Read A: Flash, temperature 0.0 (deterministic) ───────────────
-            sys_a, usr_a = get_batch_recheck_prompt(
-                prior_description=prior_desc,
-                prior_batch=prior_batch,
-                prior_code=prior_code,
-                read_index=0,
-            )
-            result_a, _ = self._call_model(
-                crop, sys_a, usr_a,
-                temperature=0.0,
-                max_tokens=300,
-                use_reasoning=False,          # Flash: no reasoning, fast
-                model_override=self.FAST_MODEL,
-                api_key_override=self.fast_api_key,
-            )
+        # Pad shorter list to n_items so zip always works
+        while len(items_a) < n_items:
+            items_a.append({})
+        while len(items_b) < n_items:
+            items_b.append({})
 
-            # ── Read B: Flash, temperature 0.6 (forced variation) ────────────
-            sys_b, usr_b = get_batch_recheck_prompt(
-                prior_description=prior_desc,
-                prior_batch=prior_batch,
-                prior_code=prior_code,
-                read_index=1,
-            )
-            result_b, _ = self._call_model(
-                crop, sys_b, usr_b,
-                temperature=0.6,
-                max_tokens=300,
-                use_reasoning=False,          # Flash: no reasoning, fast
-                model_override=self.FAST_MODEL,
-                api_key_override=self.fast_api_key,
-            )
+        _AMB = set('WVMN')
 
-            # Handle API errors on either read
-            if 'error' in result_a and 'error' in result_b:
-                print(f"   Item {idx+1}: both reads failed — keeping original")
-                continue
-            if 'error' in result_a:
-                result_a = result_b
-            if 'error' in result_b:
-                result_b = result_a
+        # ── Per-item comparison ───────────────────────────────────────────────
+        needs_arbitration: list[dict] = []   # items that need Plus
 
-            batch_a = (result_a.get('Batch') or '').strip().upper()
-            batch_b = (result_b.get('Batch') or '').strip().upper()
-            code_a  = (result_a.get('item_code') or '').strip()
-            code_b  = (result_b.get('item_code') or '').strip()
-            desc_a  = (result_a.get('description') or '').strip()
-            desc_b  = (result_b.get('description') or '').strip()
+        flash_results: list[dict] = []       # per-item best Flash answer
+        for i, (fa, fb) in enumerate(zip(items_a[:n_items], items_b[:n_items])):
+            ba = (fa.get('Batch') or '').strip().upper()
+            bb = (fb.get('Batch') or '').strip().upper()
+            ca = (fa.get('item_code') or '').strip()
+            cb = (fb.get('item_code') or '').strip()
+            da = (fa.get('description') or '').strip()
+            db = (fb.get('description') or '').strip()
 
-            # ── Compare: do both reads agree? ────────────────────────────────
-            batch_agree = (batch_a == batch_b) or (not batch_a and not batch_b)
-            code_agree  = (code_a  == code_b)
-            desc_agree  = (desc_a  == desc_b) or (not desc_a and not desc_b)
+            batch_agree = ba == bb
+            code_agree  = ca == cb
+            desc_agree  = da == db or (not da and not db)
 
-            if batch_agree and code_agree and desc_agree:
-                # Agreement — accept read A as authoritative
-                agreed += 1
-                final_batch = batch_a or prior_batch
-                final_code  = code_a
-                final_desc  = desc_a or prior_desc
-                print(f"   Item {idx+1} AGREED   batch={final_batch}  "
-                      f"[{prior_desc[:30]}]")
+            # Final Flash answer: prefer the non-empty one when only one read returned data
+            best_batch = ba or bb
+            best_code  = ca or cb
+            best_desc  = da or db
+
+            has_ambiguous = any(c in _AMB for c in best_batch)
+
+            if batch_agree and code_agree and desc_agree and not has_ambiguous:
+                # Clean agreement, no ambiguous chars — trust it
+                flash_results.append({
+                    'Batch': best_batch, 'item_code': best_code,
+                    'description': best_desc, '_needs_plus': False
+                })
             else:
-                # Disagreement — escalate to Plus arbitration
-                arbitrated += 1
-                disagreements = []
+                # Disagreement or ambiguous character — queue for Plus
+                item_desc = items[i].get('description', f'row {i+1}')
+                disc = []
                 if not batch_agree:
-                    disagreements.append(f"Batch: A={batch_a!r} B={batch_b!r}")
+                    disc.append({'row_index': i, 'field': 'Batch',
+                                 'read_a': ba, 'read_b': bb, 'description': item_desc})
+                elif has_ambiguous:
+                    # Agreed but ambiguous — show Plus both reads (same value)
+                    disc.append({'row_index': i, 'field': 'Batch',
+                                 'read_a': best_batch, 'read_b': best_batch + '?',
+                                 'description': item_desc})
                 if not code_agree:
-                    disagreements.append(f"code: A={code_a!r} B={code_b!r}")
-                if not desc_agree:
-                    disagreements.append(f"desc: A={desc_a[:25]!r} B={desc_b[:25]!r}")
-                print(f"   Item {idx+1} DISAGREE  {' | '.join(disagreements)}")
-                print(f"   Item {idx+1}  --> escalating to Plus arbitration...")
+                    disc.append({'row_index': i, 'field': 'item_code',
+                                 'read_a': ca, 'read_b': cb, 'description': item_desc})
+                needs_arbitration.extend(disc)
+                flash_results.append({
+                    'Batch': best_batch, 'item_code': best_code,
+                    'description': best_desc, '_needs_plus': True
+                })
 
-                # Arbitration prompt: show Plus both candidates + the image
-                # Focus on the most important disagreement (Batch first)
-                primary_field    = "Batch"     if not batch_agree else "item_code"
-                candidate_a_val  = batch_a     if not batch_agree else code_a
-                candidate_b_val  = batch_b     if not batch_agree else code_b
+        agreed_count    = sum(1 for r in flash_results if not r['_needs_plus'])
+        arbitrate_count = sum(1 for r in flash_results if r['_needs_plus'])
+        print(f"   Flash: {agreed_count} agreed clean, {arbitrate_count} need Plus")
 
-                sys_arb, usr_arb = get_batch_arbitration_prompt(
-                    candidate_a=candidate_a_val,
-                    candidate_b=candidate_b_val,
-                    field=primary_field,
-                    prior_description=prior_desc,
-                )
-                result_arb, _ = self._call_model(
-                    crop, sys_arb, usr_arb,
-                    temperature=0.0,
-                    max_tokens=400,
-                    use_reasoning=True,          # Plus WITH reasoning — full power
-                    model_override=None,         # PRIMARY model (Plus)
-                    api_key_override=None,
-                )
+        # ── Plus arbitration: ONE call for all ambiguous items ────────────────
+        plus_corrections: dict[int, dict] = {}   # row_index → corrected fields
 
-                if 'error' in result_arb:
-                    # Arbitration failed — fall back to read A
-                    print(f"   Item {idx+1}  arbitration failed — using read A")
-                    final_batch = batch_a or prior_batch
-                    final_code  = code_a
-                    final_desc  = desc_a or prior_desc
-                else:
-                    reason = result_arb.get('arbitration_reason', '')
-                    final_batch = (result_arb.get('Batch') or batch_a or prior_batch).strip().upper()
-                    final_code  = (result_arb.get('item_code') or code_a or '').strip()
-                    final_desc  = (result_arb.get('description') or desc_a or prior_desc).strip()
-                    print(f"   Item {idx+1}  arbitrated: batch={final_batch}  "
-                          f"reason: {reason[:60]}")
+        if needs_arbitration:
+            sys_arb, usr_arb = get_batch_arbitration_prompt(
+                prior_items=items,
+                disagreements=needs_arbitration,
+            )
+            result_arb, _ = self._call_model(
+                table_zoomed, sys_arb, usr_arb,
+                temperature=0.0, max_tokens=len(needs_arbitration) * 120 + 200,
+                use_reasoning=True,           # Full Plus reasoning
+                model_override=None, api_key_override=None,
+            )
+            if 'error' not in result_arb:
+                for corr in result_arb.get('corrections', []):
+                    ri = corr.get('row_index')
+                    if ri is not None:
+                        plus_corrections[ri] = corr
+                        reason = corr.get('reason', '')
+                        print(f"   Plus row {ri}: batch={corr.get('Batch','')}  "
+                              f"reason: {reason[:55]}")
+            else:
+                print(f"   Plus arbitration failed — using Flash results")
 
-            # ── Apply final values to item ────────────────────────────────────
+        # ── Apply final results to items ──────────────────────────────────────
+        corrections = 0
+        for i, item in enumerate(items):
+            fr = flash_results[i] if i < len(flash_results) else {}
+            pc = plus_corrections.get(i)
+
+            # Plus overrides Flash when available
+            final_batch = (pc.get('Batch') or fr.get('Batch') or '').strip().upper()
+            final_code  = (pc.get('item_code') if pc and pc.get('item_code') is not None
+                           else fr.get('item_code') or '').strip()
+            final_desc  = (pc.get('description') or fr.get('description') or '').strip()
+
+            prior_batch = str(item.get('Batch') or '').strip().upper()
+            prior_code  = str(item.get('item_code') or '').strip()
+            prior_desc  = str(item.get('description') or '').strip()
+
             changed = []
-            if final_batch and final_batch != prior_batch.upper():
+            if final_batch and final_batch != prior_batch:
                 item['Batch'] = final_batch
-                changed.append(f"Batch {prior_batch!r} -> {final_batch!r}")
+                changed.append(f"Batch {prior_batch!r}->{final_batch!r}")
             if final_code is not None and final_code != prior_code:
                 item['item_code'] = final_code
-                changed.append(f"code {prior_code!r} -> {final_code!r}")
+                changed.append(f"code {prior_code!r}->{final_code!r}")
             if final_desc and final_desc != prior_desc:
                 item['description'] = final_desc
                 changed.append(f"desc corrected")
 
             if changed:
                 corrections += 1
-                print(f"   Item {idx+1} CORRECTED  {' | '.join(changed)}")
+                print(f"   Item {i+1} CORRECTED  {' | '.join(changed)}")
 
-        print(f"\n[recheck] {n_items} items: {agreed} agreed, "
-              f"{arbitrated} arbitrated, {corrections} corrected")
+        print(f"\n[recheck] {n_items} items — {corrections} corrected, "
+              f"calls: 2 Flash + {'1 Plus' if needs_arbitration else '0 Plus'}")
         print(f"{'='*80}\n")
         return items
 

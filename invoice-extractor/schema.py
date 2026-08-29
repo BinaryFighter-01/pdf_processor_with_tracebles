@@ -387,8 +387,16 @@ SYSTEM_PROMPT = (
     '  \n'
     '  ⚠️ SIDE-BY-SIDE LAYOUT: Some invoices print two copies on the SAME page\n'
     '  split left and right (Customer Copy | Office Copy).\n'
-    '  Both halves contain identical items. Extract from the LEFT side only.\n'
-    '  If the same product+batch+qty appears again in the right half → skip it.\n'
+    '  \n'
+    '  DETECTION: side-by-side layout if you see:\n'
+    '  • Item table appears TWICE horizontally (left half + right half)\n'
+    '  • Vertical dividing line or gap in the middle of the page\n'
+    '  • Labels: Customer Copy, Office Copy, Original, Duplicate at top of each half\n'
+    '  • Sr.No. sequence 1,2,3... appears TWICE across the page width\n'
+    '  \n'
+    '  RULE: Extract from LEFT half ONLY. Count each item exactly ONCE.\n'
+    '  If Sr.No. sequence restarts after a vertical gap → everything after is a duplicate.\n'
+    '  NEVER output the same (description + batch + qty) more than once.\n'
     '  \n'
     '  If multiple pages contain the SAME:\n'
     '  • invoice_number\n'
@@ -1664,14 +1672,20 @@ def get_items_prompt() -> tuple[str, str]:
         "• NEVER copy codes between different items\n"
         "• Also called: Prod Code, Product Code, Item Code\n\n"
 
-        "⚠️ SIDE-BY-SIDE DUPLICATE LAYOUT (very common in Indian pharma invoices):\n"
-        "Some invoices print TWO copies of the item table side by side on the same page:\n"
-        "  LEFT HALF  = Customer Copy  |  RIGHT HALF = Office Copy / Hospital Copy\n"
-        "Both halves contain IDENTICAL items with the same batches, quantities, rates.\n"
-        "RULE: Extract items from ONE side only (the left/first occurrence).\n"
-        "DO NOT extract the same item twice just because it appears in both halves.\n"
-        "Signal: if you see the same product name + batch + qty appear again in the\n"
-        "right portion of the same page → it is the duplicate copy, skip it.\n\n"
+        "⚠️⚠️⚠️ SIDE-BY-SIDE DUPLICATE LAYOUT — MANDATORY DEDUP RULE:\n"
+        "Many Indian pharma invoices print TWO identical copies on ONE page:\n"
+        "  LEFT HALF  = Customer Copy  |  RIGHT HALF = Office / Hospital Copy\n"
+        "Both halves have the SAME items, same batches, same quantities, same amounts.\n\n"
+        "DETECTION: You are reading a side-by-side layout if you see:\n"
+        "  • The item table appears TWICE horizontally on the same page\n"
+        "  • A dividing vertical line or gap in the middle of the page\n"
+        "  • Labels like 'Customer Copy', 'Office Copy', 'Original', 'Duplicate'\n"
+        "    printed at the top of each half\n"
+        "  • The same Sr.No. 1, 2, 3... sequence appears TWICE across the page width\n\n"
+        "RULE: Extract from LEFT half ONLY. Count each item ONCE.\n"
+        "If item with Sr.No.1 appears at x=50px and AGAIN at x=500px → skip the second.\n"
+        "If Sr.No. sequence restarts after a vertical gap → everything after the gap is a duplicate.\n"
+        "NEVER output the same (description + batch + quantity) more than once per invoice.\n\n"
         
         "CRITICAL: Extract from the CURRENT invoice ONLY. Never use memory, cached values,\n"
         "or information from previous invoices. Every value must come from this invoice's OCR.\n"
@@ -1884,134 +1898,147 @@ def get_items_prompt() -> tuple[str, str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BATCH RECHECK PROMPT  (zoom-in row-crop pass)
+# BATCH RECHECK PROMPTS  (batched table-region approach)
 # ─────────────────────────────────────────────────────────────────────────────
+
 def get_batch_recheck_prompt(
-    prior_description: str = "",
-    prior_batch: str = "",
-    prior_code: str = "",
-    read_index: int = 0,          # 0 = first read, 1 = second independent read
+    prior_items: list[dict],
+    read_index: int = 0,
 ) -> tuple[str, str]:
     """
-    Prompt for a single Flash read of one zoomed invoice row.
-
-    read_index=0  → First read (deterministic, temperature 0.0)
-    read_index=1  → Second independent read (temperature 0.6, slightly varied
-                    phrasing so the model doesn't just repeat itself)
-
-    Returns (system_prompt, user_prompt).
+    Prompt for the batch recheck pass — sent to the FULL item table crop.
+    read_index=0: Plus with reasoning (authoritative read)
+    read_index=1: Flash cross-check (cheap disagreement detector)
     """
 
     read_note = (
-        "\n\nIMPORTANT: This is your SECOND independent reading of this row.\n"
-        "Do NOT simply repeat the prior extraction. Look at the image fresh.\n"
-        "Pay special attention to characters that could be W/V, M/N, 1/I/J, 0/O.\n"
+        "\n\nThis is your SECOND independent reading.\n"
+        "Do NOT copy the first-pass values. Look at the image fresh.\n"
+        "Pay extra attention to W/V and M/N — these are the most commonly wrong.\n"
     ) if read_index == 1 else ""
 
     system_prompt = (
-        "You are a pharmaceutical invoice OCR specialist performing a CHARACTER-LEVEL "
-        "accuracy check on a SINGLE zoomed invoice row.\n\n"
+        "You are a pharmaceutical invoice OCR specialist.\n"
+        "You will receive ONE image: the item table from an invoice, zoomed 4x for clarity.\n\n"
 
-        "You will receive ONE image: a single row from an invoice table, "
-        "upscaled so characters are large and clear.\n\n"
+        "Your ONLY job: re-read the character-critical fields for EVERY item row:\n"
+        "  1. Batch number  — most error-prone field\n"
+        "  2. Item code     — format AL-XX-XXXX or blank\n"
+        "  3. Description   — product name\n\n"
 
-        "Your ONLY job: read THREE fields from this row:\n"
-        "  1. Batch number  (alphanumeric, e.g. ABWG0002, EMV261280A, RF1826001)\n"
-        "  2. Item code     (format AL-XX-XXXX or similar; blank string if absent)\n"
-        "  3. Description   (product name, e.g. TORPANEL 4 TAB, SYMBAL 60 TAB)\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "MANDATORY RULE — W vs V (you MUST follow this before writing any batch):\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "BEFORE writing any batch character that could be W or V:\n"
+        "  Step 1: Count the downward-pointing tips of the character.\n"
+        "          W has THREE downward tips (like two V shapes joined).\n"
+        "          V has ONE downward tip.\n"
+        "  Step 2: Check the width.\n"
+        "          W is clearly WIDER than the surrounding letters.\n"
+        "          V is the same width as a normal letter.\n"
+        "  Step 3: Write W if you count 3 tips or see extra width.\n"
+        "          Write V only if you count exactly 1 tip.\n\n"
+        "Common batch containing W: ABWG0002 — the 3rd character has 3 downward tips.\n"
+        "If you write ABVG0002 you are wrong — V has only 1 tip, W has 3.\n\n"
 
-        "CHARACTER RULES — apply to EVERY character in Batch and item_code:\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "M vs N (second most common error):\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  M = 4 strokes, wider.  N = 3 strokes, narrower.\n"
+        "  Count strokes before writing. EMV not ENV.\n\n"
 
-        "W vs V  (most common error):\n"
-        "  W = THREE downward points, WIDER character\n"
-        "  V = ONE downward point, narrower\n"
-        "  Count the downward points before writing\n\n"
-
-        "M vs N:\n"
-        "  M = FOUR strokes, wider\n"
-        "  N = THREE strokes, narrower\n"
-        "  Count strokes before writing\n\n"
-
-        "J vs 1: if surrounded by digits → digit 1, not letter J\n\n"
-
-        "0 vs O, 8 vs B, 5 vs S, 1 vs I:\n"
-        "  Digit neighbours → digit form\n"
-        "  Letter neighbours → letter form\n\n"
-
-        "Drug descriptions: copy branded names exactly — do NOT correct to English.\n"
-        "  SYMBAL, TORPANEL, STALIX etc. are correct even if they look misspelt.\n\n"
+        "Other rules:\n"
+        "  J vs 1: digit neighbours → digit 1, not letter J.\n"
+        "  0/O, 8/B, 5/S, 1/I: digit neighbours → digit, letter neighbours → letter.\n"
+        "  Drug names: copy EXACTLY — SYMBAL not SYMBOL (branded name).\n\n"
 
         "OUTPUT: ONLY valid JSON, first character {, no markdown.\n"
-        '{"Batch": "...", "item_code": "...", "description": "..."}'
+        "Return items in the SAME ORDER as the table rows.\n"
+        '{"items": [\n'
+        '  {"Batch": "...", "item_code": "...", "description": "..."},\n'
+        '  ...\n'
+        ']}'
         + read_note
     )
 
-    prior_section = ""
-    if any([prior_description, prior_batch, prior_code]):
-        prior_section = (
-            "\n\nFIRST-PASS VALUES (may contain OCR errors — verify independently):\n"
-            f"  description : {prior_description or 'unknown'}\n"
-            f"  Batch       : {prior_batch or 'unknown'}\n"
-            f"  item_code   : {prior_code if prior_code is not None else 'unknown'}\n\n"
-            "Confirm OR correct. Focus on Batch — most errors are there.\n"
+    prior_lines = []
+    for i, item in enumerate(prior_items):
+        desc  = item.get('description', 'unknown')
+        batch = item.get('Batch', 'unknown')
+        code  = item.get('item_code', '')
+        prior_lines.append(
+            f"  Row {i+1}: description={desc!r}  Batch={batch!r}  item_code={code!r}"
         )
 
     user_prompt = (
-        "Zoomed invoice row image attached.\n"
-        + prior_section
-        + "\nRead Batch, item_code, description. Apply W/V/M/N/J-1 rules per character.\n"
+        "Zoomed invoice table image attached (4x upscale).\n\n"
+        "PRIOR EXTRACTION VALUES (may contain W/V errors — verify each batch carefully):\n"
+        + "\n".join(prior_lines)
+        + "\n\nFor EVERY batch: count the downward tips before writing.\n"
+        "W = 3 tips (wider).  V = 1 tip (narrower).\n"
+        "Confirm or correct each row. Return ALL rows in order.\n"
         "Return ONLY JSON:\n"
-        '{"Batch": "...", "item_code": "...", "description": "..."}'
+        '{"items": [{"Batch": "...", "item_code": "...", "description": "..."}, ...]}'
     )
 
     return system_prompt, user_prompt
 
 
 def get_batch_arbitration_prompt(
-    candidate_a: str,
-    candidate_b: str,
-    field: str = "Batch",
-    prior_description: str = "",
+    prior_items: list[dict],
+    disagreements: list[dict],
 ) -> tuple[str, str]:
     """
-    Prompt for Plus to arbitrate between two conflicting Flash reads.
+    Prompt for Plus to resolve disagreements between the two Flash reads.
 
-    Shown the zoomed image + both candidates, Plus must decide which is correct
-    (or provide a third option if both are wrong).
+    prior_items    : full list of item dicts (for context)
+    disagreements  : list of dicts, each with:
+                     {row_index, field, read_a, read_b, description}
 
     Returns (system_prompt, user_prompt).
     """
     system_prompt = (
         "You are a senior pharmaceutical invoice OCR auditor.\n\n"
 
-        "Two independent OCR reads of the same invoice row DISAGREE on one field.\n"
-        "You will see the zoomed row image and both candidate values.\n"
-        "Your job: examine the image carefully and decide which is correct.\n\n"
+        "Two independent OCR reads of the same invoice table DISAGREE on specific fields.\n"
+        "You will see the zoomed table image and the list of disagreements.\n"
+        "Your job: examine each disagreement carefully and provide the correct value.\n\n"
 
-        "THIS IS THE DECIDING PASS. Be precise. Zoom in mentally on every character.\n\n"
+        "THIS IS THE DECIDING PASS. Be precise.\n\n"
 
-        f"The disagreement is on the {field.upper()} field.\n\n"
+        "CHARACTER VERIFICATION (mandatory for each disagreement):\n"
+        "  W vs V: count downward points — W=3, V=1. W is wider.\n"
+        "  M vs N: count strokes — M=4, N=3. M is wider.\n"
+        "  J vs 1: digit neighbours → it is digit 1.\n"
+        "  0 vs O, 8 vs B, 5 vs S: use neighbour context.\n\n"
 
-        "CHARACTER VERIFICATION (mandatory before answering):\n"
-        "  For each character that differs between the two candidates:\n"
-        "  1. Count strokes: W=4 peaks/3 points, V=2 strokes/1 point, M=4, N=3\n"
-        "  2. Check width: W wider than V, M wider than N\n"
-        "  3. Check digit/letter context: surrounded by digits→digit, letters→letter\n"
-        "  4. Make a definitive call\n\n"
-
-        "OUTPUT: ONLY valid JSON, first character {, no markdown, no explanation.\n"
-        '{"Batch": "final_correct_value", "item_code": "...", "description": "...", '
-        '"arbitration_reason": "one sentence explaining which character and why"}'
+        "OUTPUT: ONLY valid JSON. First character {. No markdown.\n"
+        "Return ONLY the rows that had disagreements, identified by row_index (0-based).\n"
+        '{"corrections": [\n'
+        '  {"row_index": 0, "Batch": "final", "item_code": "final", '
+        '"description": "final", "reason": "one sentence"}\n'
+        "]}"
     )
 
+    disagreement_lines = []
+    for d in disagreements:
+        row   = d['row_index']
+        field = d['field']
+        desc  = d.get('description', '')
+        a     = d['read_a']
+        b     = d['read_b']
+        disagreement_lines.append(
+            f"  Row {row} ({desc[:30]!r}): {field} — Read A={a!r}  Read B={b!r}"
+        )
+
     user_prompt = (
-        f"Zoomed invoice row for: {prior_description or 'this item'}\n\n"
-        f"Two OCR reads disagree on {field}:\n"
-        f"  Read A: {candidate_a}\n"
-        f"  Read B: {candidate_b}\n\n"
-        "Examine the image. Which is correct?\n"
-        "If both are wrong, provide the correct value.\n"
-        "Return ONLY JSON with your final answer and a one-sentence reason."
+        "Zoomed invoice table image attached.\n\n"
+        "DISAGREEMENTS TO RESOLVE:\n"
+        + "\n".join(disagreement_lines)
+        + "\n\nFor each disagreement: examine the image at that row and decide.\n"
+        "Return ONLY the corrected rows in JSON:\n"
+        '{"corrections": [{"row_index": N, "Batch": "...", "item_code": "...", '
+        '"description": "...", "reason": "..."}]}'
     )
 
     return system_prompt, user_prompt
