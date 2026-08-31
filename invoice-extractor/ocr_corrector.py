@@ -601,13 +601,12 @@ def apply_ocr_corrections(data: dict) -> dict:
                     print(f"[OCR-FIX] Description '{original_desc}' -> '{corrected_desc}' (human correction)")
                     break
 
-        # ── Value = null when no explicit "Value" column exists ───────────────
-        # Rule: Value field must ONLY be populated from an explicit "Value" column.
-        # If model copied taxable_value or AMOUNT into Value (common mistake),
-        # set Value = null.
-        # Detection: if Value == taxable_value (copied from TAXABLE column)
-        #            OR Value == total_price (copied from AMOUNT column)
-        # → both are wrong → null out Value
+        # ── Value = null unless it's clearly from a real "Value" column ──────
+        # Rule: Value must ONLY be from an explicit "Value" column.
+        # If Value == taxable_value → null (model copied TAXABLE into Value)
+        # If Value == total_price   → null (model copied AMOUNT into Value)
+        # Only keep Value when it differs from BOTH taxable_value AND total_price
+        # (that means it genuinely came from a separate "Value" column)
         def _to_f(v):
             try:
                 return float(str(v).replace(',', '').replace('₹', '').strip()) if v is not None else None
@@ -615,19 +614,17 @@ def apply_ocr_corrections(data: dict) -> dict:
                 return None
 
         try:
-            val  = _to_f(item.get('Value'))
-            tv   = _to_f(item.get('taxable_value'))
-            tp   = _to_f(item.get('total_price'))
+            val = _to_f(item.get('Value'))
+            tv  = _to_f(item.get('taxable_value'))
+            tp  = _to_f(item.get('total_price'))
             if val is not None:
-                same_as_taxable = (tv is not None and abs(val - tv) < 0.02)
-                # Only null when Value == taxable_value
-                # (model copied TAXABLE column into Value)
-                # Do NOT null when Value == total_price but Value != taxable_value
-                # (that's a real Value/AMOUNT column with discount applied)
-                if same_as_taxable:
+                same_as_taxable = (tv is not None and abs(val - tv) < 0.05)
+                same_as_total   = (tp is not None and abs(val - tp) < 0.05)
+                if same_as_taxable or same_as_total:
                     item['Value'] = None
                     corrections_made += 1
-                    print(f"[OCR-FIX] Value nulled (was copy of taxable_value): {val} "
+                    reason = 'taxable_value' if same_as_taxable else 'total_price'
+                    print(f"[OCR-FIX] Value=null (was copy of {reason}={val}) "
                           f"[{item.get('description','')[:35]}]")
         except Exception:
             pass
