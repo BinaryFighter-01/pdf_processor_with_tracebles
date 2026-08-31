@@ -6,6 +6,8 @@ Flask backend with vanilla JavaScript frontend
 import os
 import json
 import time
+import threading
+import queue
 from pathlib import Path
 from flask import Flask, request, render_template, jsonify, Response
 from flask_cors import CORS
@@ -86,9 +88,105 @@ def index():
     return render_template('index.html')
 
 
+@app.route('/api/extract/stream', methods=['POST'])
+def extract_invoice_stream():
+    """
+    Streaming version of /api/extract using Server-Sent Events (SSE).
+    Sends heartbeat pings every 5 seconds so the browser never times out,
+    even for 3-5 minute extractions (recovery passes, large invoices).
+
+    Browser connects with EventSource. Events:
+      {type: "progress", message: "..."}  — heartbeat / step update
+      {type: "result",   data:    {...}}  — final success result
+      {type: "error",    error:   "..."}  — final failure
+    """
+    file = request.files.get('file')
+    if not file or file.filename == '':
+        return jsonify({'error': 'No file uploaded'}), 400
+    if not allowed_file(file.filename):
+        return jsonify({'error': 'File type not supported'}), 400
+
+    # Read everything from request BEFORE spawning thread
+    file_bytes  = file.read()
+    filename    = secure_filename(file.filename)
+    use_ocr     = request.form.get('use_ocr',    'true').lower() == 'true'
+    use_cache   = request.form.get('use_cache',  'true').lower() == 'true'
+    two_pass    = request.form.get('two_pass',   'true').lower() == 'true'
+    multi_page  = request.form.get('multi_page', 'true').lower() == 'true'
+
+    result_q: queue.Queue = queue.Queue()
+
+    def _bg():
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(
+            delete=False, suffix=Path(filename).suffix,
+            dir=app.config['UPLOAD_FOLDER']
+        )
+        try:
+            tmp.write(file_bytes); tmp.flush(); tmp.close()
+            # Save file path and use Flask test client to call existing endpoint
+            # This reuses 100% of existing extract_invoice() logic
+            with app.test_request_context():
+                from io import BytesIO
+                from werkzeug.test import EnvironBuilder
+                from werkzeug.datastructures import FileStorage
+                builder = EnvironBuilder(
+                    method='POST',
+                    data={
+                        'file': FileStorage(BytesIO(file_bytes), filename=filename),
+                        'use_ocr': 'true',
+                        'use_cache': 'true' if use_cache else 'false',
+                        'two_pass': 'true' if two_pass else 'false',
+                        'multi_page': 'true' if multi_page else 'false',
+                    }
+                )
+                env = builder.get_environ()
+                from flask import Request as FlaskRequest
+                req = FlaskRequest(env)
+
+            # Actually just POST directly via test client
+            with app.test_client() as c:
+                form_data = {
+                    'use_ocr': 'true',
+                    'use_cache': 'true' if use_cache else 'false',
+                    'two_pass': 'true' if two_pass else 'false',
+                    'multi_page': 'true' if multi_page else 'false',
+                }
+                from io import BytesIO
+                resp = c.post(
+                    '/api/extract',
+                    data={**form_data, 'file': (BytesIO(file_bytes), filename)},
+                    content_type='multipart/form-data'
+                )
+                result = json.loads(resp.data)
+            result_q.put({'type': 'result', 'data': result})
+        except Exception as ex:
+            import traceback
+            result_q.put({'type': 'error', 'error': str(ex),
+                          'traceback': traceback.format_exc()})
+        finally:
+            try: os.remove(tmp.name)
+            except Exception: pass
+
+    threading.Thread(target=_bg, daemon=True).start()
+
+    def _sse():
+        while True:
+            try:
+                item = result_q.get(timeout=4.0)
+                yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+                if item['type'] in ('result', 'error'):
+                    break
+            except queue.Empty:
+                # Keep-alive ping — prevents browser/proxy timeout
+                yield f"data: {json.dumps({'type':'progress','message':'Processing...'})}\n\n"
+
+    return Response(_sse(), mimetype='text/event-stream',
+                    headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
+
 @app.route('/api/extract', methods=['POST'])
 def extract_invoice():
-    """Extract invoice data from uploaded file with optional OCR, caching, two-pass, and multi-page support."""
     
     # Check if file is present
     if 'file' not in request.files:
@@ -943,7 +1041,10 @@ def extract_invoice():
                 '_validation_warnings', '_validation_errors',
                 '_gst_rate_corrected', '_invoice_review_reasons',
             ]
-            deprecated_fields = ['seller_DL_Number', 'customer_DL_Number']
+            deprecated_fields = [
+                'seller_DL_Number', 'customer_DL_Number',
+                'expected_item_count',  # internal field used for count verification, not for output
+            ]
 
             # Remove all underscore-prefixed internal fields from top-level data
             keys_to_delete = [k for k in list(data.keys())
@@ -984,55 +1085,12 @@ def extract_invoice():
         #   Invoice prints: 11124.80
         #   Our calc:       10749.81 + 187.49 + 187.49 = 11124.79  ← wrong
         # ═══════════════════════════════════════════════════════════
-        log_step("Checking total_price (override only when model confused taxable with total)...")
-        try:
-            from decimal import Decimal, ROUND_HALF_UP
-
-            def _dec(v):
-                """Convert to Decimal, return 0 for None/empty."""
-                if v is None or v == '' or v == 'null':
-                    return Decimal('0')
-                try:
-                    return Decimal(str(v).replace(',', '').replace('₹', '').strip())
-                except Exception:
-                    return Decimal('0')
-
-            total_price_fixes = 0
-            for item in extracted_data.get('items', []):
-                taxable = _dec(item.get('taxable_value'))
-                cgst    = _dec(item.get('cgst_amount'))
-                sgst    = _dec(item.get('sgst_amount'))
-                igst    = _dec(item.get('igst_amount'))
-                current = _dec(item.get('total_price'))
-
-                has_taxable = taxable > 0
-                has_gst     = (cgst + sgst + igst) > 0
-
-                if not (has_taxable and has_gst):
-                    continue
-
-                computed = (taxable + cgst + sgst + igst).quantize(
-                    Decimal('0.01'), rounding=ROUND_HALF_UP
-                )
-
-                # Only override when total_price == taxable_value (model confused columns)
-                # A tolerance of 0.02 handles trivial float/string conversion noise.
-                model_copied_taxable = abs(current - taxable) <= Decimal('0.02')
-
-                if model_copied_taxable:
-                    old_price = item.get('total_price')
-                    item['total_price'] = float(computed)
-                    total_price_fixes += 1
-                    log_step(f"  total_price fixed (was taxable): {old_price} -> {float(computed):.2f} "
-                             f"[{item.get('description', '')[:35]}]")
-                # else: model read the AMOUNT column correctly — leave it alone
-
-            if total_price_fixes == 0:
-                log_step("total_price: all values read correctly from invoice")
-            else:
-                log_step(f"total_price: {total_price_fixes} item(s) corrected (taxable->net)")
-        except Exception as tp_err:
-            log_step(f"total_price check error (non-fatal): {tp_err}")
+        # total_price: always use extracted value — never overwrite
+        # The old "recalculate if total_price == taxable_value" logic was
+        # incorrect: when AMOUNT == TAXABLE (no discount on item), it wrongly
+        # replaced the correct AMOUNT with taxable + GST (e.g. 2218 → 2328.90).
+        # Rule: total_price = exactly what the model extracted from AMOUNT column.
+        log_step("total_price: using extracted values as-is (no overwrite)")
 
         # ═══════════════════════════════════════════════════════════
         # FORMAT MONETARY FIELDS WITH 2 DECIMALS (AS STRINGS)

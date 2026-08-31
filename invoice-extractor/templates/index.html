@@ -359,22 +359,64 @@ async function performExtraction(useCache = true) {
   formData.append('use_cache', useCache ? 'true' : 'false');
 
   try {
-    const response = await fetch('/api/extract', { method: 'POST', body: formData });
-    const result = await response.json();
-    clearInterval(progressInterval);
-    updateLoadingSteps(4);
-    await new Promise(resolve => setTimeout(resolve, 500));
-    loadingIndicator.style.display = 'none';
-    resultsContent.style.display = 'block';
-    if (result.success) {
-      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-      document.querySelector('[data-tab="summary"]').classList.add('active');
-      document.getElementById('summaryTab').classList.add('active');
-      displayResults(result);
-    } else {
-      displayError(result.error);
-    }
+    // Use Server-Sent Events streaming so long extractions (3-5 min)
+    // never hit browser timeout. The server sends heartbeat pings
+    // every 4 seconds to keep the connection alive.
+    await new Promise((resolve, reject) => {
+      const url = '/api/extract/stream';
+
+      // POST via fetch to get a ReadableStream (SSE over POST)
+      fetch(url, { method: 'POST', body: formData })
+        .then(response => {
+          if (!response.ok) {
+            return response.json().then(e => { throw new Error(e.error || 'Server error'); });
+          }
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
+
+          function read() {
+            reader.read().then(({ done, value }) => {
+              if (done) { resolve(); return; }
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split('\n');
+              buffer = lines.pop(); // keep incomplete line
+              lines.forEach(line => {
+                if (!line.startsWith('data: ')) return;
+                try {
+                  const evt = JSON.parse(line.slice(6));
+                  if (evt.type === 'progress') {
+                    // Update loading message
+                    const msgEl = document.querySelector('.loading-text');
+                    if (msgEl && evt.message !== 'Processing...')
+                      msgEl.textContent = evt.message;
+                  } else if (evt.type === 'result') {
+                    clearInterval(progressInterval);
+                    updateLoadingSteps(4);
+                    loadingIndicator.style.display = 'none';
+                    resultsContent.style.display = 'block';
+                    if (evt.data && evt.data.success) {
+                      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                      document.querySelector('[data-tab="summary"]').classList.add('active');
+                      document.getElementById('summaryTab').classList.add('active');
+                      displayResults(evt.data);
+                    } else {
+                      displayError((evt.data && evt.data.error) || 'Extraction failed');
+                    }
+                    resolve();
+                  } else if (evt.type === 'error') {
+                    reject(new Error(evt.error || 'Extraction error'));
+                  }
+                } catch (e) { /* ignore malformed line */ }
+              });
+              read();
+            }).catch(reject);
+          }
+          read();
+        })
+        .catch(reject);
+    });
   } catch (error) {
     clearInterval(progressInterval);
     loadingIndicator.style.display = 'none';

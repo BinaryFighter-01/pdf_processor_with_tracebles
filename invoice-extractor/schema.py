@@ -1197,18 +1197,16 @@ USER_PROMPT = (
     '                      - "amount" = rupees (e.g., 401.79 means ₹401.79)\n\n'
 
     
-    '  Value             → Item-level value/taxable amount BEFORE GST\n'
-    '                      ⚠️ CRITICAL: Extract from the "Value" column when it exists\n'
-    '                      \n'
-    '                      Rules:\n'
-    '                      - If invoice has a "Value" column → extract it\n'
-    '                      - If invoice has NO "Value" column → null\n'
-    '                      - Never copy taxable_value into Value\n'
-    '                      - Never assume Value = taxable_value\n'
-    '                      - If both columns missing → both null\n'
-    '                      \n'
-    '                      Value represents pre-GST subtotal for THIS ITEM ONLY\n'
-    '                      NEVER return null when a "Value" column is visible in the table\n\n'
+    '  Value             → Gross line amount from the "Value" / "AMOUNT" column ONLY\n'
+    '                      ⚠️ STRICT RULE:\n'
+    '                      - If invoice has an explicit "Value", "AMOUNT", or "Gross" column → extract it\n'
+    '                      - If invoice has NO such column → Value = null\n'
+    '                      - NEVER copy taxable_value into Value\n'
+    '                      - NEVER copy TAXABLE column into Value\n'
+    '                      - Value ≠ taxable_value (they are different fields)\n'
+    '                      - If unsure whether a column is "Value" vs "TAXABLE" → use the column header\n'
+    '                        "Value" / "AMOUNT" → Value field\n'
+    '                        "TAXABLE" / "TAXABLE AMT" → taxable_value field\n\n'
 
     
     '  Gst%              → GST rate for this item\n'
@@ -1475,24 +1473,33 @@ USER_PROMPT = (
 
     '═══════════════════════ VALUE vs TAXABLE VALUE (STRICT RULE) ═══════════════════════\n'
     '⚠️⚠️⚠️ "Value" and "taxable_value" are DIFFERENT fields - never copy one to the other.\n\n'
-    '⚠️ STRICT COLUMN COPYING (HIGHEST PRIORITY):\n'
-    'If invoice has a TAXABLE column (labeled "TAXABLE", "TAXABLE AMT", "TAXABLE AMOUNT"):\n'
-    '  1. Copy TAXABLE column value directly to BOTH Value and taxable_value\n'
-    '  2. NEVER calculate: AMOUNT - DISC\n'
-    '  3. NEVER use arithmetic\n'
-    '  4. Trust the printed TAXABLE value\n\n'
+    '⚠️ VALUE vs TAXABLE_VALUE — STRICT COLUMN MAPPING:\n'
+    '\n'
+    'Value field rule:\n'
+    '  Value = extract ONLY from a printed "Value", "AMOUNT", "Gross", "NET AMT" column\n'
+    '  If the invoice does NOT have such a column → Value = null\n'
+    '  NEVER copy taxable_value into Value\n'
+    '  NEVER copy TAXABLE column into Value\n'
+    '  Value and taxable_value are DIFFERENT fields\n\n'
+    'taxable_value field rule:\n'
+    '  If invoice has a TAXABLE column (labeled "TAXABLE", "TAXABLE AMT", "TAXABLE AMOUNT"):\n'
+    '    → taxable_value = TAXABLE column value (exact copy)\n'
+    '    → DO NOT put this in Value\n'
+    '  If no TAXABLE column → derive taxable_value from other data\n\n'
     'Extraction Priority:\n'
-    '1. If TAXABLE column exists → Value = TAXABLE (exact copy), taxable_value = TAXABLE (exact copy)\n'
-    '2. If NO TAXABLE column → Extract "Value" from item Amount/Value column (if exists)\n'
-    '                        → Extract "taxable_value" from invoice GST/tax summary (after discounts)\n'
+    '1. Value = only from "Value" / "AMOUNT" / "Gross" column if it exists → else null\n'
+    '2. taxable_value = from TAXABLE column if it exists → else derive\n'
+    '3. NEVER set Value = taxable_value unless invoice literally has a "Value" column\n'
+    '   whose values match what would be taxable_value\n\n'
     '3. For single-item invoices: taxable_value = invoice summary taxable amount\n'
     '4. Only if no taxable value exists anywhere: taxable_value may equal Value\n\n'
     'COLUMN MAPPING (mandatory):\n'
-    '• AMOUNT   → Gross amount (do NOT use for taxable_amount)\n'
+    '• AMOUNT   → Value field (if "AMOUNT" is the gross column)\n'
+    '• Value    → Value field (if invoice has explicit "Value" column)\n'
     '• DISC     → Discount (separate field)\n'
     '• SCHEME   → Scheme Amount (separate field)\n'
     '• CD AMT   → Cash Discount (separate field)\n'
-    '• TAXABLE  → taxable_value (copy directly)\n'
+    '• TAXABLE  → taxable_value ONLY (never copy to Value)\n'
     '• CGST     → total_cgst_amount\n'
     '• SGST     → total_sgst_amount\n'
     '• TOTAL    → invoice_amount\n\n'
@@ -1971,9 +1978,11 @@ def get_items_prompt() -> tuple[str, str]:
         "  (when it represents the pre-GST item subtotal, not the final net amount)\n"
         "  If such a column exists → copy the value exactly\n"
         "  If no such column exists anywhere → null\n"
-        "  NEVER return null when a Value/Amount/Amt column is visible in the table\n"
+        "  ⚠️ Value = ONLY from 'Value' or 'AMOUNT' column. If only TAXABLE column exists → Value = null\n"
+        "  NEVER copy TAXABLE column value into Value field\n"
         "- taxable_value: from TAXABLE/TAXABLE AMT column; different from Value\n"
         "  If TAXABLE column exists → copy to taxable_value (NEVER calculate)\n"
+        "  taxable_value ≠ Value — they come from different columns\n"
         "- NEVER leave GST fields null when invoice summary contains values\n"
         "- For single-item invoices: apply summary GST values to that item\n"
     )

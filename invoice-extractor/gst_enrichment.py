@@ -158,7 +158,7 @@ def enrich_item_gst(item: Dict[str, Any], is_intra_state: bool = True) -> Dict[s
 
         if gst_percent and gst_percent > 0 and gst_amt_val and gst_amt_val > 0:
             if current_tv is None:
-                # taxable_value missing — try Value - Discount first, then Value
+                # taxable_value genuinely missing — derive from Value - Discount
                 discount_pct = _to_float(item.get('Discount'))
                 if gross_value and discount_pct and discount_pct > 0:
                     disc_amt = round_to_2(gross_value * discount_pct / 100)
@@ -168,24 +168,7 @@ def enrich_item_gst(item: Dict[str, Any], is_intra_state: bool = True) -> Dict[s
                 if tv_candidate:
                     item['taxable_value'] = tv_candidate
                     current_tv = tv_candidate
-            else:
-                # taxable_value is set — verify it against GST_AMT
-                expected_gst = round_to_2(current_tv * gst_percent / 100)
-                tolerance = 0.05  # allow up to 5 paisa rounding difference
-                if abs(expected_gst - gst_amt_val) > tolerance:
-                    # Cross-check failed — model likely copied gross Value
-                    # Try Value - Discount as the corrected taxable
-                    discount_pct = _to_float(item.get('Discount'))
-                    if gross_value and discount_pct and discount_pct > 0:
-                        disc_amt = round_to_2(gross_value * discount_pct / 100)
-                        tv_corrected = round_to_2(gross_value - disc_amt)
-                        expected_gst_corrected = round_to_2(tv_corrected * gst_percent / 100)
-                        if abs(expected_gst_corrected - gst_amt_val) <= tolerance:
-                            print(f"[GST] taxable_value corrected: "
-                                  f"{current_tv} -> {tv_corrected} "
-                                  f"(Value {gross_value} - Discount {discount_pct}% = {tv_corrected})")
-                            item['taxable_value'] = tv_corrected
-                            item['Value'] = gross_value  # preserve gross as Value
+            # else: taxable_value is printed — keep it as-is, never overwrite
         elif current_tv is None and gross_value:
             # No GST to cross-check — fall back to Value
             item['taxable_value'] = gross_value
