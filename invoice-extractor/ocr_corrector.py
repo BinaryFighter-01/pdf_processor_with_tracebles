@@ -601,6 +601,37 @@ def apply_ocr_corrections(data: dict) -> dict:
                     print(f"[OCR-FIX] Description '{original_desc}' -> '{corrected_desc}' (human correction)")
                     break
 
+        # ── Value = null when no explicit "Value" column exists ───────────────
+        # Rule: Value field must ONLY be populated from an explicit "Value" column.
+        # If model copied taxable_value or AMOUNT into Value (common mistake),
+        # set Value = null.
+        # Detection: if Value == taxable_value (copied from TAXABLE column)
+        #            OR Value == total_price (copied from AMOUNT column)
+        # → both are wrong → null out Value
+        def _to_f(v):
+            try:
+                return float(str(v).replace(',', '').replace('₹', '').strip()) if v is not None else None
+            except Exception:
+                return None
+
+        try:
+            val  = _to_f(item.get('Value'))
+            tv   = _to_f(item.get('taxable_value'))
+            tp   = _to_f(item.get('total_price'))
+            if val is not None:
+                same_as_taxable = (tv is not None and abs(val - tv) < 0.02)
+                # Only null when Value == taxable_value
+                # (model copied TAXABLE column into Value)
+                # Do NOT null when Value == total_price but Value != taxable_value
+                # (that's a real Value/AMOUNT column with discount applied)
+                if same_as_taxable:
+                    item['Value'] = None
+                    corrections_made += 1
+                    print(f"[OCR-FIX] Value nulled (was copy of taxable_value): {val} "
+                          f"[{item.get('description','')[:35]}]")
+        except Exception:
+            pass
+
         # Item code — normalize slashes to hyphens, strip surrounding dots/spaces
         original_code = item.get('item_code')
         if original_code and isinstance(original_code, str):
