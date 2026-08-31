@@ -342,6 +342,38 @@ def extract_invoice():
             log_step(f"⚠️  OCR correction error (non-fatal): {ocr_fix_error}")
 
         # ═══════════════════════════════════════════════════════════
+        # FIX: invoice_amount vs round_off reconciliation
+        # Some invoices show both "Total Amount" and "TO PAY":
+        #   Total Amount = 69221.18
+        #   Round Off    = -0.18
+        #   TO PAY       = 69221.00
+        # Model sometimes extracts Total Amount instead of TO PAY.
+        # Rule: If round_off exists and invoice_amount + round_off
+        #       gives a rounder number (ends in .00), that's the real final.
+        # ═══════════════════════════════════════════════════════════
+        try:
+            invoice_amt = extracted_data.get('invoice_amount')
+            round_off = extracted_data.get('round_off')
+            
+            if invoice_amt and round_off is not None:
+                inv_float = float(str(invoice_amt).replace(',', ''))
+                ro_float = float(str(round_off).replace(',', ''))
+                
+                # Calculate what final amount should be
+                expected_final = round(inv_float + ro_float, 2)
+                
+                # If current invoice_amount + round_off gives a rounder number,
+                # and they differ by more than 1 paisa, fix it
+                if abs(expected_final - inv_float) > 0.01:
+                    # Check if expected_final is rounder (ends in .00 or .50)
+                    fractional = abs(expected_final - int(expected_final))
+                    if fractional < 0.01 or abs(fractional - 0.5) < 0.01:
+                        log_step(f"[FIX] invoice_amount: {inv_float} + round_off ({ro_float}) = {expected_final}")
+                        extracted_data['invoice_amount'] = str(expected_final)
+        except (ValueError, TypeError) as e:
+            pass  # Keep original if conversion fails
+
+        # ═══════════════════════════════════════════════════════════
         # TYPE NORMALIZATION
         # ═══════════════════════════════════════════════════════════
         log_step("Normalizing data types...")
@@ -576,6 +608,89 @@ def extract_invoice():
             extracted_data['_verification'] = verification_result
             status = verification_result.get('verification_status', 'UNKNOWN')
             log_step(f"✅ Verification complete: {status}")
+
+            # ─── LAYER 4: Verification-driven item recovery ──────────
+            # If verification flags missing items, re-extract them.
+            # This fires ONLY when the model explicitly says items are missing.
+            if status == 'FAIL':
+                discrepancies = verification_result.get('discrepancies', [])
+                missing_items_disc = [
+                    d for d in discrepancies
+                    if 'item' in str(d.get('field', '')).lower()
+                    and ('missing' in str(d.get('invoice_shows', '')).lower()
+                         or 'items' in str(d.get('field', '')).lower()
+                         and d.get('severity') in ('critical', 'high'))
+                ]
+
+                if missing_items_disc:
+                    log_step(f"⚠️  Verification flagged missing items — triggering targeted recovery")
+
+                    current_count = len(extracted_data.get('items', []))
+                    expected_from_verify = None
+
+                    # Try to parse expected count from verification discrepancy
+                    for d in missing_items_disc:
+                        inv_shows = str(d.get('invoice_shows', ''))
+                        import re
+                        m = re.search(r'(\d+)\s*items?\s*(?:present|on invoice|total)', inv_shows, re.I)
+                        if m:
+                            expected_from_verify = int(m.group(1))
+                            break
+
+                    # Build hint about which items are already found
+                    found_descs = "\n".join(
+                        f"  - {it.get('description', '?')[:50]} (Batch={it.get('Batch','?')}, Qty={it.get('quantity','?')})"
+                        for it in extracted_data.get('items', [])
+                        if str(it.get('description') or '').strip()
+                    )
+
+                    from schema import get_items_prompt as _get_items_prompt
+                    items_sys, base_items_prompt_v4 = _get_items_prompt()
+
+                    count_hint = f"EXACTLY {expected_from_verify}" if expected_from_verify else "ALL"
+                    recovery_prompt_v4 = (
+                        base_items_prompt_v4 +
+                        f"\n\n⚠️⚠️⚠️ VERIFICATION FAILED — ITEMS ARE MISSING:\n"
+                        f"The previous extraction is INCOMPLETE.\n"
+                        f"Items already extracted ({current_count}):\n"
+                        + found_descs +
+                        f"\n\nMissing item hints from verification:\n"
+                        + "\n".join(f"  - {d.get('invoice_shows', '')}" for d in missing_items_disc) +
+                        f"\n\nExtract {count_hint} items from this invoice.\n"
+                        f"Include items at page boundaries, continuation rows, and all table rows.\n"
+                    )
+
+                    recovery_v4_data, _ = client.extract_invoice(
+                        processed_images,
+                        items_sys,
+                        recovery_prompt_v4,
+                        temperature=0.0,
+                        max_tokens=16000,
+                        use_reasoning=True
+                    )
+
+                    recovery_v4_items = recovery_v4_data.get('items', []) if 'items' in recovery_v4_data else []
+                    log_step(f"[v4-recovery] Got {len(recovery_v4_items)} items (was {current_count})")
+
+                    if len(recovery_v4_items) > current_count:
+                        # Dedup and merge
+                        seen_v4: set = set()
+                        merged_v4 = []
+                        for it in recovery_v4_items:
+                            k = (
+                                str(it.get('description') or '').strip().upper(),
+                                str(it.get('Batch') or '').strip().upper(),
+                                str(it.get('quantity') or '')
+                            )
+                            if k not in seen_v4:
+                                seen_v4.add(k)
+                                merged_v4.append(it)
+                        extracted_data['items'] = merged_v4
+                        log_step(f"✅ Layer-4 recovery: {current_count} → {len(merged_v4)} items")
+                        # Update verification status to reflect recovery
+                        extracted_data['_verification']['_recovery_applied'] = True
+                    else:
+                        log_step(f"⚠️  Layer-4 recovery didn't improve count — keeping original")
         except Exception as verify_error:
             log_step(f"⚠️  Verification error (non-fatal): {verify_error}")
             extracted_data['_verification'] = {

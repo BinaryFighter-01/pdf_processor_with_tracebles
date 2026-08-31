@@ -525,7 +525,59 @@ def apply_ocr_corrections(data: dict) -> dict:
                 corrections_made += 1
                 print(f"[OCR-FIX] Batch '{original_batch}' -> '{corrected}' (human correction)")
 
-        # ── Human-verified description corrections (prefix match) ─────────────
+        # ── Parse embedded fields out of description ──────────────────────────
+        # Some invoices print Batch/Expiry/Code/MRP as sub-lines inside the
+        # product name cell. The model sometimes dumps all of it into description.
+        # Example:
+        #   "SP 8747 H 1 (Centilene...) Batch : CF 289 Expiry : 30-Jun-30 Code : AL-02-1234"
+        # We parse out those fields and put them in their correct attributes.
+        desc = item.get('description') or ''
+        if isinstance(desc, str) and _re.search(
+            r'\b(Batch|Expiry|Code|MRP|OLD MRP)\s*:', desc, _re.IGNORECASE
+        ):
+            # Extract batch from description if Batch field is empty
+            m_batch = _re.search(r'\bBatch\s*:\s*([A-Z0-9/ -]+?)(?:\s+(?:Expiry|Code|MRP|$)|\s*$)',
+                                  desc, _re.IGNORECASE)
+            if m_batch and not str(item.get('Batch') or '').strip():
+                item['Batch'] = m_batch.group(1).strip()
+                corrections_made += 1
+                print(f"[OCR-FIX] Batch extracted from description: '{item['Batch']}'")
+
+            # Extract expiry from description if expiry_date field is empty
+            m_exp = _re.search(
+                r'\bExpiry\s*:\s*(\d{1,2}[-/]\w{3,9}[-/]\d{2,4}|\d{2}[-/]\d{2}[-/]\d{2,4})',
+                desc, _re.IGNORECASE)
+            if m_exp and not str(item.get('expiry_date') or '').strip():
+                raw_exp = m_exp.group(1).strip()
+                item['expiry_date'] = correct_date(raw_exp)
+                corrections_made += 1
+                print(f"[OCR-FIX] Expiry extracted from description: '{item['expiry_date']}'")
+
+            # Extract item_code from description if item_code field is empty
+            m_code = _re.search(r'\bCode\s*:\s*([A-Z]{2}-\d{2}-\d{4})', desc, _re.IGNORECASE)
+            if m_code and not str(item.get('item_code') or '').strip():
+                item['item_code'] = m_code.group(1).strip()
+                corrections_made += 1
+                print(f"[OCR-FIX] item_code extracted from description: '{item['item_code']}'")
+
+            # Extract MRP — prefer new MRP over OLD MRP
+            m_mrp = _re.search(r'(?<!OLD\s)\bMRP\s*:\s*([\d.,]+)', desc, _re.IGNORECASE)
+            m_old_mrp = _re.search(r'\bOLD\s+MRP\s*:\s*([\d.,]+)', desc, _re.IGNORECASE)
+            if m_mrp and not item.get('MRP'):
+                item['MRP'] = m_mrp.group(1).replace(',', '')
+                corrections_made += 1
+                print(f"[OCR-FIX] MRP extracted from description: '{item['MRP']}'")
+            elif m_old_mrp and not item.get('MRP'):
+                item['MRP'] = m_old_mrp.group(1).replace(',', '')
+
+            # Clean description: remove everything from first "Batch :" / "Expiry :" / "Code :" onward
+            clean_desc = _re.split(
+                r'\s+(?:Batch|Expiry|Code|MRP|OLD\s+MRP)\s*:', desc, flags=_re.IGNORECASE
+            )[0].strip().rstrip(',').rstrip()
+            if clean_desc != desc:
+                item['description'] = clean_desc
+                corrections_made += 1
+                print(f"[OCR-FIX] Description cleaned: '{clean_desc}'")        # ── Human-verified description corrections (prefix match) ─────────────
         # Use prefix match so "SYMBOL 60 TAB (AL-01-5861)" matches key "SYMBOL 60 TAB"
         original_desc = item.get('description')
         if original_desc and isinstance(original_desc, str):

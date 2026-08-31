@@ -1,70 +1,131 @@
 ================================================================================
                         INVOICE EXTRACTOR - PROJECT EXPLANATION
-                        AI-Powered Invoice Data Extraction System
+                    AI-Powered Invoice Data Extraction System
+                         Last Updated: August 2026
 ================================================================================
 
 PROJECT OVERVIEW
 ----------------
 Invoice Extractor is a web-based application that automatically reads invoice
-images or PDFs and extracts all important data from them using Artificial
-Intelligence. Instead of manually typing invoice details, you simply upload the
-file and the system returns all fields as structured JSON data within seconds.
+images or PDFs and extracts all important data using AI. Instead of manually
+typing invoice details, you upload a file and the system returns structured
+JSON data within seconds.
 
-The system is built to handle real-world Indian pharmaceutical and hospital
-invoices which are complex - they have multiple pages, free items (bonus
-quantities), GST breakdowns, PO numbers hidden in remarks, and rotated scans.
+The system is built specifically for real-world Indian pharmaceutical and
+hospital invoices (primarily LMMF Deenanath Mangeshkar Hospital supply chain).
+These invoices are complex — multi-page, multi-vendor, duplicate/triplicate
+copies, free items, GST breakdowns, multiple discount types, mixed GST slabs,
+items split across pages, and PO numbers hidden in remarks sections.
 
 --------------------------------------------------------------------------------
 TECH STACK
 --------------------------------------------------------------------------------
 
-  Backend  : Python 3.11, Flask (web framework)
-  Frontend : HTML, CSS, JavaScript (single file, no frameworks)
-  AI Model : Qwen Vision Model (via OpenRouter API)
-  OCR      : Baidu Qianfan OCR (via OpenRouter API, free tier)
-  PDF      : PyMuPDF (converts PDF pages to images)
-  Image    : OpenCV + Pillow (rotation, contrast, sharpening)
-  Cache    : File-based SHA-256 hash cache (JSON files)
-  Hosting  : Local server (can be exposed via ngrok for public access)
+  Backend   : Python 3.11, Flask (web server on port 8001)
+  Frontend  : HTML + CSS + JavaScript (single-file UI, no frameworks)
+  Primary AI: qwen/qwen3.7-plus  (items pass — character-level accuracy)
+  Fast AI   : qwen/qwen3.7-flash (header/totals/verify — speed + cost)
+  API Route : OpenRouter (https://openrouter.ai)
+  PDF       : PyMuPDF (renders PDF pages to images)
+  Image     : OpenCV + Pillow (rotation, contrast, compression)
+  Tracing   : LangSmith (full request/response traces for debugging)
+  Cache     : File-based SHA-256 hash cache (JSON files in uploads/.cache/)
 
 --------------------------------------------------------------------------------
-SYSTEM ARCHITECTURE - HOW DATA FLOWS
+TWO-MODEL STRATEGY (CURRENT)
+--------------------------------------------------------------------------------
+
+The system uses TWO different models for different passes:
+
+  PASS 1 (Header fields) → qwen/qwen3.7-flash (FAST model)
+    Fast, cheap. Header fields like invoice number, dates, names, GSTINs
+    are large readable text. No need for character-level accuracy.
+
+  PASS 2 (Financial totals) → qwen/qwen3.7-flash (FAST model)
+    Fast, cheap. Total amounts, GST sums, round-off values are clear numbers.
+
+  PASS 3 (Line items) → qwen/qwen3.7-plus (PRIMARY model)
+    Expensive, accurate. Batch codes like "RUA12505A" vs "RUA12505B",
+    item codes like "SR-06-1905" vs "SR-06-1905", expiry dates — all
+    require character-level precision. Flash would misread these.
+
+  VERIFICATION → qwen/qwen3.7-plus (PRIMARY model)
+    Cross-checks extracted JSON against the invoice image.
+    Flags critical mismatches in amounts, quantities, batch codes.
+
+WHY THIS MATTERS:
+  - Flash is ~13x cheaper than Plus
+  - Passes 1 and 2 use Flash = low cost, fast response
+  - Pass 3 (most important) uses Plus = max accuracy where it counts
+  - Net result: good balance of cost, speed, and accuracy
+
+ENV CONFIGURATION:
+  MODEL_NAME=qwen/qwen3.7-plus         ← primary model (items)
+  FAST_MODEL_NAME=qwen/qwen3.7-flash   ← fast model (header/totals)
+  FAST_MODEL_API_KEY=                  ← optional separate key for flash
+
+--------------------------------------------------------------------------------
+SYSTEM ARCHITECTURE — HOW DATA FLOWS
 --------------------------------------------------------------------------------
 
   1. User uploads invoice (PDF / JPG / PNG / TIFF / BMP / WebP)
          |
-  2. app_web.py receives file
+  2. app_web.py receives file → checks cache
+     --> If cached: return instantly (skip all steps below)
+     --> If new: continue
          |
-  3. cache_manager.py checks if same file was processed before
-     --> If YES: return cached result instantly (skip all steps below)
-     --> If NO: continue
+  3. pdf_utils.py converts PDF pages to images (if PDF)
          |
-  4. pdf_utils.py converts PDF pages to images (if PDF)
+  4. preprocessing.py cleans each image:
+         |-- Detects rotation (heuristic-based)
+         |-- Applies CLAHE contrast enhancement
+         |-- Compresses image for API payload limits
          |
-  5. preprocessing.py cleans each image:
-         |-- ocr_client.py detects if image is rotated (0/90/180/270 degrees)
-         |-- Applies rotation correction
-         |-- Applies contrast enhancement (CLAHE)
+  5. Copy detection (model_client.py)
+         |-- Classifies invoice as ORIGINAL / DUPLICATE / TRIPLICATE
+         |-- Only UNIQUE pages are sent for extraction
+         |-- Duplicate/triplicate pages are skipped
          |
-  6. model_client.py sends image to AI model (3 separate API calls):
-         |-- Call 1: Extract header fields only  (invoice no, date, PO, seller, buyer)
-         |-- Call 2: Extract totals only          (GST amounts, invoice amount, round off)
-         |-- Call 3: Extract line items only      (products, batch, qty, price, HSN)
-         |   (For multi-page: all pages combined into one tall image before sending)
+  6. Multi-pass extraction (model_client.py)
+         |-- Pass 1: Header fields    → Flash model
+         |-- Pass 2: Financial totals → Flash model
+         |-- Pass 3: Items per page   → Plus model
+         |   |-- Continuation hints injected for items split across pages
+         |   |-- Chunked extraction fallback if model hits output limit
          |
-  7. app_web.py normalizes data types (converts strings to numbers, cleans symbols)
+  7. Continuation merge (model_client.py)
+         |-- Items split at page boundaries are stitched together
+         |-- Orphan continuation rows merged into preceding item
          |
-  8. gst_enrichment.py fills missing GST fields per item
+  8. Deduplication (model_client.py)
+         |-- Removes identical items appearing across duplicate pages
          |
-  9. free_item_splitter.py splits "20+2" quantities into 2 separate records
+  9. app_web.py post-processing
+         |-- OCR corrections (ocr_corrector.py)
+         |-- invoice_amount round-off reconciliation
+         |-- Type normalization (strings → numbers, date formatting)
+         |-- GSTIN validation and hardcode overrides (gstin_validator.py)
+         |-- Seller GSTIN lookup (seller_gstin_lookup.py)
          |
- 10. gst_calculator.py validates GST consistency
+ 10. GST enrichment (gst_enrichment.py)
+         |-- Fills missing per-item GST fields
+         |-- Validates GST component consistency
+         |-- GST_AMT = CGST + SGST (component-sum method, not bulk calc)
          |
- 11. cache_manager.py saves result for future reuse
+ 11. Free item splitting (free_item_splitter.py)
+         |-- Splits "20+2" quantities into 2 separate records
          |
- 12. JSON response sent back to browser
+ 12. Consistency check (consistency_checker.py)
+         |-- Cross-validates all financial figures
+         |-- Flags discrepancies as _needs_review
          |
- 13. templates/index.html displays result in 5 tabs
+ 13. Verification pass (model_client.py)
+         |-- Sends extracted JSON + image back to Plus model
+         |-- Detects critical mismatches (wrong items, missing items, etc.)
+         |
+ 14. Cache result + return JSON to browser
+         |
+ 15. templates/index.html displays result in 5 tabs
 
 --------------------------------------------------------------------------------
 FILE-BY-FILE EXPLANATION
@@ -72,487 +133,504 @@ FILE-BY-FILE EXPLANATION
 
 1. app_web.py
    -----------
-   Role    : Main server file - the backbone of the entire application
-   Type    : Python / Flask
-
-   This is where everything starts and ends. It runs the web server and
-   contains the main API endpoint (/api/extract) that handles file uploads.
+   Role: Main Flask server — orchestrates the entire pipeline
+   Port: 8001 (changed from 5000)
 
    Key responsibilities:
-   - Starts Flask web server on port 5000
-   - Receives uploaded files from the browser
-   - Orchestrates the full extraction pipeline (steps 3-12 above)
-   - Performs type normalization (e.g., "3,053.68" becomes 3053.68)
-   - Formats dates to DD/MM/YYYY format
-   - Adds invoice_id and currency_code to output
-   - Calculates total_quantity by summing ONLY paid items (not free items)
-   - Returns final JSON response to browser
-   - Also serves /api/health endpoint to check if API key is configured
+   - Receives uploaded files and runs the full extraction pipeline
+   - Applies OCR corrections via ocr_corrector.py
+   - invoice_amount round-off reconciliation:
+       If extracted invoice_amount + round_off gives a rounder number,
+       the system corrects invoice_amount to the TO PAY value.
+       Example: 69221.18 + (-0.18) = 69221.00 → fixes to 69221.00
+   - Type normalization: "3,053.68" → 3053.68, dates → DD/MM/YYYY
+   - Calculates total_quantity as sum of PAID items only (free_item_yn="0")
+   - Serves /api/extract (POST) and /api/health (GET)
 
-   Configuration it reads from .env file:
-   - OPENROUTER_API_KEY (required)
-   - MODEL_NAME (which AI model to use)
-   - CACHE_ENABLED, CACHE_MAX_AGE_HOURS
-   - MAX_PDF_PAGES (default: 20)
+   LangSmith tracing is enabled — every extraction is logged with full
+   input/output for debugging via LANGCHAIN_API_KEY in .env
 
 
 2. schema.py
    ----------
-   Role    : AI prompt definitions - instructions given to the AI model
-   Type    : Python (contains only text strings, no logic)
+   Role: AI prompt definitions — the rulebook for the AI
 
-   This file is the most important for extraction accuracy. It contains
-   carefully written instructions that tell the AI exactly how to read an
-   invoice. Think of it as the "rulebook" for the AI.
+   Contains carefully written rules for every field. Key sections:
 
-   Contains:
-   - SYSTEM_PROMPT : Tells AI its role ("You are an OCR extraction engine,
-                     output only valid JSON, first character must be {")
-                     Also contains multi-page rules, null value policy,
-                     global field search rules, and core principles.
+   MULTI-LINE PRODUCT CELL RULE (recently added):
+     Some invoices print Batch/Expiry/Code below the product name in
+     the same table cell. Example:
+       Line 1: SP 8747 H 1 (Centilene : 7-0 9.3mm...)
+       Line 2: Batch : CF 289
+       Line 3: Expiry : 30-Jun-30
+       Line 4: Code : AL-02-1234
+     Rule: description = Line 1 only. Other lines → their own fields.
 
-   - USER_PROMPT   : Full extraction rules for every field. Covers:
-                     * Where to search for PO number (header, remarks, footer,
-                       last page - check ALL locations before returning null)
-                     * How to handle expiry dates (MM/YY → DD-MM-YYYY)
-                     * How to detect free items (FREE/BONUS/SCHEME columns)
-                     * Item code extraction from description brackets
-                     * GST derivation rules when columns are missing
-                     * Value vs taxable_value distinction
-                     * Batch number normalization
+   INVOICE_AMOUNT PRIORITY (recently added):
+     Some invoices show "Total Amount" AND "TO PAY" separately:
+       Total Amount = 69221.18  (pre round-off)
+       Round Off    = -0.18
+       TO PAY       = 69221.00  ← this is invoice_amount
+     Priority: TO PAY > NET PAYABLE > GRAND TOTAL > Invoice Amount
 
-   - get_header_prompt()  : Focused prompt - extract ONLY header fields
-   - get_totals_prompt()  : Focused prompt - extract ONLY financial totals
-   - get_items_prompt()   : Focused prompt - extract ONLY line items
+   MIXED GST SLAB HANDLING (recently added):
+     If invoice has items at 5% AND 18% GST:
+       total_gst_rate = null  (no single rate exists)
+       total_cgst_rate = null
+       total_cgst_amount = SUM of all CGST rows from GST summary table
+     Single-slab invoices: total_gst_rate = CGST% + SGST% as before.
 
-   Why 3 separate prompts? Because the AI performs better when focused on
-   one specific task rather than trying to extract everything at once.
-   This is called the "3-pass extraction strategy".
+   MULTI-ROW GST SUMMARY TABLE (recently added):
+     Some invoices have GST breakdown by rate:
+       5%  → CGST: 1198.47,  SGST: 1198.47
+       18% → CGST:  311.57,  SGST:  311.57
+       Total CGST: 1510.04   Total SGST: 1510.04
+     Rule: extract from TOTAL row, not first/individual rows.
+
+   3 focused prompts (pass separation):
+     get_header_prompt()  → header fields only
+     get_totals_prompt()  → financial totals only
+     get_items_prompt()   → line items only
 
 
 3. model_client.py
    ----------------
-   Role    : Communicates with the AI model via OpenRouter API
-   Type    : Python
+   Role: All AI model communication, extraction orchestration
 
-   This file handles all network communication with the AI. It sends invoice
-   images to the AI and receives the extracted JSON data back.
+   Key additions since original version:
 
-   Key methods:
+   TWO-MODEL ROUTING:
+     call_fast() → uses FAST_MODEL (Flash) for header/totals/verify
+     call_primary() → uses PRIMARY_MODEL (Plus) for items pass
+     Separate API keys supported (FAST_MODEL_API_KEY env var)
 
-   extract_invoice()
-   - Converts PIL image to base64 string
-   - Sends HTTP POST request to OpenRouter API with image + prompts
-   - Parses JSON from AI response
-   - Has repair_json() to fix common AI mistakes (missing brackets,
-     trailing commas, unquoted property names)
-   - Retry logic: retries up to 2 times on timeout
-   - Handles API errors: 402 (no credits), 401 (bad key), 429 (rate limit)
+   COPY DETECTION:
+     classify_copy() detects ORIGINAL / DUPLICATE / TRIPLICATE / HOSPITAL
+     Multi-page PDFs often have 2-3 identical pages (customer/transporter/
+     office copies). Only UNIQUE content pages are extracted.
 
-   extract_invoice_two_pass()
-   - Used for single-page invoices
-   - Makes 3 API calls: header (500 tokens) → totals (300 tokens) → items (3000 tokens)
-   - Merges all 3 results into one complete JSON
+   CHUNKED EXTRACTION (recently added):
+     Problem: Some invoices have 10-15 items. Qwen3.7-plus stops mid-JSON
+     after ~3000 chars, truncating to 4 items.
+     Solution: If extracted items < 8, automatic chunked fallback:
+       - Split invoice image into top 55% and bottom 55% (10% overlap)
+       - Extract each chunk separately (5-6 items fits within limit)
+       - Merge results with deduplication at chunk boundary
+       - Continuation hint passed to bottom chunk for split items
+     Cost: 2 API calls only when needed (large invoices)
+     Normal invoices (≤7 items): 1 API call as before.
 
-   extract_invoice_multipage()
-   - Used for multi-page PDFs
-   - CRITICAL DESIGN: Instead of processing pages separately, it combines
-     ALL pages into one tall image (stacked vertically)
-   - Then makes 3 API calls, each time sending the complete document
-   - This ensures fields like PO number on the last page are never missed
-   - After extraction, runs duplicate detection to remove repeated items
-     that sometimes appear at page boundaries
+   _extract_items_chunked():
+     Handles item continuations within chunks:
+       - If top chunk's last item is missing Batch/Expiry, passes hint
+       - Bottom chunk receives: "Previous item 'X' may be incomplete"
+       - Bottom chunk returns _continuation_for_previous_page=true if needed
+       - Merge logic patches continuation data into top chunk's last item
+     Deduplication at boundary: description+Batch match check
+     None safety: all .get() calls use str(val or '') pattern
 
+   CONTINUATION MERGE:
+     Items split across page boundaries are detected and merged:
+       Page 1 item: description + qty, but Batch=null (data on page 2)
+       Page 2 first row: Batch + Expiry, no description
+       Merge: patches Batch/Expiry/Code into the prior item
+     _is_continuation(): detects rows with metadata but no description
+     _CONTINUATION_FIELDS: Batch, expiry_date, item_code, hsn_sac, Pack, MRP
 
-4. ocr_client.py
-   --------------
-   Role    : Detects invoice rotation using Baidu Qianfan OCR model
-   Type    : Python
-
-   Many invoices are scanned sideways or upside down. This file detects
-   the rotation before sending to the main AI model.
-
-   Key methods:
-
-   detect_orientation()
-   - Sends image to Baidu Qianfan OCR (free model via OpenRouter)
-   - Asks: "Is this document rotated 0, 90, 180, or 270 degrees?"
-   - Returns (rotation_angle, confidence_score)
-   - If confidence is too low, preprocessing.py falls back to heuristic method
-
-   extract_text()
-   - Extracts raw text from image (not used in main pipeline but available)
+   max_tokens per pass:
+     Header:       4,000 tokens
+     Totals:       6,000 tokens
+     Items (multi-page): 16,000 tokens (increased from 8,000)
+     Items (single-page): 16,000 tokens
+     Chunked items:       8,000 per chunk
 
 
-5. pdf_utils.py
-   -------------
-   Role    : Converts PDF files into images
-   Type    : Python
-
-   The AI vision model cannot read PDF files directly. It only understands
-   images. This file handles the conversion.
-
-   Functions:
-
-   pdf_to_images(pdf_path, dpi=150)
-   - Opens PDF using PyMuPDF library
-   - Renders each page as a PNG image at 150 DPI
-   - Returns list of PIL Image objects (one per page)
-   - Skips pages that fail to render (with warning)
-
-   get_pdf_page_count(pdf_path)
-   - Simply returns how many pages a PDF has
-
-
-6. preprocessing.py
+4. ocr_corrector.py
    -----------------
-   Role    : Cleans and prepares invoice images for AI extraction
-   Type    : Python
+   Role: Deterministic post-extraction fixes (no API calls)
 
-   Raw scanned images are often imperfect. This file improves image quality
-   before sending to the AI, which directly improves extraction accuracy.
+   Key rules applied after AI extraction:
 
-   Classes:
+   DESCRIPTION FIELD PARSING (recently added):
+     Detects if Batch/Expiry/Code/MRP keywords appear inside description.
+     Example (wrong): "SP 8747 H 1 (Centilene...) Batch : CF 289 Expiry : 30-Jun-30"
+     Fix:
+       description = "SP 8747 H 1 (Centilene...)"  (cleaned)
+       Batch = "CF 289"  (extracted from description)
+       expiry_date = "30/06/2030"  (extracted from description)
+     Rule: Only fills fields that are currently empty. Never overwrites.
 
-   OrientationDetector
-   - Tries Qianfan OCR first for rotation detection (most accurate)
-   - Falls back to heuristic if OCR unavailable or fails:
-     * Checks if image is portrait (may need rotation)
-     * Measures ink density at top vs bottom
-     * Invoice headers always have more ink at top (logo, company name)
-   - Corrects rotation using OpenCV
+   BATCH CORRECTIONS:
+     Human-verified batch lookup table (batch_corrections.json)
+     Maps known misread batch codes to correct values.
 
-   ImagePreprocessor.process()
-   - Full preprocessing pipeline:
-     Step 1: Orientation correction (fixes 90/180/270 degree rotations)
-     Step 2: Skew correction (fixes slightly tilted scans using Hough lines)
-     Step 3: Contrast enhancement (CLAHE - makes faded text clearer)
-     Step 4: Optional denoising (smooths noise but can blur text)
-     Step 5: Optional sharpening (makes text edges crisper)
-   - For multi-page PDFs, rotation detection only runs on page 1 (saves API calls)
+   GSTIN CORRECTIONS:
+     Single-character OCR fixes (1→I, 0→O for known positions)
+     Hardcode overrides for known customer GSTINs
+     (Deenanath hospital GSTIN is hardcoded to prevent misread)
 
-
-7. cache_manager.py
-   -----------------
-   Role    : Caches extraction results to avoid reprocessing same invoices
-   Type    : Python
-
-   If you upload the same invoice twice, there's no reason to call the AI again
-   and waste time and API credits. This file handles intelligent caching.
-
-   How it works:
-   - When a file is uploaded, generates SHA-256 hash of: file bytes + options
-   - Checks uploads/.cache/ folder for a JSON file with that hash
-   - If found and not expired: returns cached result immediately
-   - If not found: processes normally, saves result as {hash}.json
-
-   Key methods:
-   generate_cache_key() - Creates unique fingerprint for file + options
-   get()               - Retrieves cached result if valid
-   set()               - Stores new result in cache
-   clear()             - Deletes old/all cache entries
-   get_stats()         - Returns count, total size, age of cache entries
-
-   Cache settings (from .env):
-   - CACHE_ENABLED=true
-   - CACHE_MAX_AGE_HOURS=24 (entries expire after 24 hours)
-   - CACHE_DIRECTORY=uploads/.cache
+   DATE NORMALIZATION:
+     All expiry date formats → DD/MM/YYYY
+     Handles: MM/YY, MM-YY, MM/YYYY, DD-MMM-YY, DD-Mon-YYYY
 
 
-8. free_item_splitter.py
-   ----------------------
-   Role    : Splits free/bonus items into separate invoice records
-   Type    : Python
+5. gstin_validator.py
+   -------------------
+   Role: GSTIN format validation and correction
 
-   Pharmaceutical invoices frequently include free items with purchases.
-   Example: "Buy 20 tablets, get 2 free" shown as quantity "20+2"
-
-   The system splits this into 2 separate line items:
-   - Record 1: quantity=20, free_item_yn="0" (paid item, keeps original prices)
-   - Record 2: quantity=2,  free_item_yn="1" (free item, proportional prices)
-
-   Handles 3 patterns:
-   1. Combined format  : quantity = "20+2" (string with plus sign)
-   2. Separate columns : quantity = 20, free_quantity = 2 (two fields)
-   3. No free items    : quantity = 20 (normal item, just adds free_item_yn="0")
-
-   create_proportional_item()
-   - UNCHANGED fields (same on both records):
-     description, Pack, Batch, hsn_sac, item_code, expiry_date,
-     unit_price, Gst%, MRP, cgst_rate, sgst_rate, igst_rate, Discount
-   - RECALCULATED fields (proportional to new quantity):
-     total_price = unit_price × new_quantity
-     Value, taxable_value, GST_AMT, cgst_amount, sgst_amount, igst_amount
-     (all scaled by new_qty / paid_qty ratio)
-
-   After splitting, app_web.py calculates total_quantity as sum of ONLY
-   paid items (free_item_yn = "0"), which is the correct business figure.
+   GSTIN format: 2-digit state code + 10-digit PAN + 1Z + 1 check digit
+   Validates structure, corrects common OCR errors (O↔0, I↔1, S↔5)
+   Hardcoded overrides for known customers that AI consistently misreads.
 
 
-9. gst_calculator.py
+6. seller_gstin_lookup.py
+   -----------------------
+   Role: Seller GSTIN hardcode lookup table
+
+   Maintains a lookup of seller names → correct GSTINs.
+   When seller GSTIN is extracted with low confidence, this overrides it.
+   Prevents systematic misreads for repeat vendors.
+
+
+7. consistency_checker.py
+   -----------------------
+   Role: Cross-validates extracted financial figures
+
+   Checks:
+   - Rate × Qty ≈ AMOUNT (within tolerance)
+   - AMOUNT - Discount ≈ taxable_value
+   - taxable_value × GST% ≈ GST_AMT (within 5 paisa)
+   - CGST + SGST ≈ GST_AMT
+   - Sum of item GST_AMTs ≈ total_gst_amount
+   - invoice_amount ≈ sum of line totals + round_off
+
+   Flags items with _needs_review=true and _review_reasons=[...]
+   Non-blocking: extraction succeeds even if checks fail.
+
+
+8. gst_enrichment.py
    ------------------
-   Role    : GST validation and enrichment following Indian tax rules
-   Type    : Python
+   Role: Per-item GST derivation and validation
 
-   Handles all Indian GST business logic.
+   GST_AMT COMPONENT-SUM FIX (recently added):
+     Old behaviour: GST_AMT = round(taxable × rate%)
+     Problem: taxable=3987.78, rate=5%
+       Direct:     round(3987.78 × 5%) = 199.39
+       Components: CGST=99.69, SGST=99.69 → sum=199.38
+       Mismatch: 199.39 ≠ 199.38 (matches invoice line-by-line)
+     Fix: Calculate components first, then GST_AMT = CGST + SGST
+     This matches how invoice printers calculate line-by-line rounding.
 
-   Key rules implemented:
-   - Intra-state transaction: CGST + SGST (split equally, both same rate)
-   - Inter-state transaction: IGST only (no CGST or SGST)
-   - CGST must always equal SGST for intra-state
+   enrich_item_gst() priority:
+     1. Printed components (CGST + SGST) → keep, source="invoice"
+     2. GST_AMT and Gst% → split into components
+     3. taxable_value and Gst% → calculate all
+     4. Nothing available → source="not_calculated", leave null
 
-   determine_transaction_type()
-   - If invoice has CGST/SGST amounts → intra-state
-   - If invoice has IGST amounts → inter-state
-   - Default: intra-state (most common for pharma invoices)
-
-   enrich_item_with_gst()
-   - Does NOT overwrite values extracted from invoice
-   - Only fills GST_AMT if it's missing but CGST + SGST are available
-
-   calculate_invoice_totals()
-   - Fills total_gst_amount if missing: CGST + SGST + IGST
-   - Fills GST rates from item-level data if missing at header level
-   - Does NOT touch invoice_amount or taxable_amount (those come from AI)
-
-   validate_gst()
-   - Checks CGST equals SGST (with 2 paisa tolerance for rounding)
-   - Returns validation report with errors and warnings
-
-   _calculate_confidence()
-   - Scores 0.0 to 1.0 based on data completeness
-   - Reduces score for missing GSTIN, calculated vs extracted values, etc.
+   taxable_value correction:
+     If taxable_value × GST% ≠ GST_AMT (by >5 paisa), and
+     Value - Discount × Value matches better → corrects taxable_value
+     This catches the common error of model copying gross Value into
+     taxable_value field (ignoring discount).
 
 
-10. gst_enrichment.py
+9. free_item_splitter.py
+   ----------------------
+   Role: Splits free/bonus items into separate records
+
+   Handles quantity formats: "20+2", "20 + 2", separate free_qty column
+   Paid record: qty=20, free_item_yn="0", original prices
+   Free record:  qty=2,  free_item_yn="1", proportional prices
+   total_quantity = sum of paid quantities only
+
+
+10. pdf_utils.py
+    -------------
+    Role: PDF to image conversion using PyMuPDF (fitz)
+    DPI: 150 (configurable via RENDER_DPI in .env)
+    Returns list of PIL Images (one per page)
+    Page count limited by MAX_PDF_PAGES (default: 10)
+
+
+11. preprocessing.py
+    -----------------
+    Role: Image cleaning before AI extraction
+
+    Pipeline per image:
+    1. Rotation correction (heuristic: ink density at top vs bottom)
+    2. CLAHE contrast enhancement (improves faded text)
+    3. Compression for API limits:
+       - Tries JPEG 95%, 90%, 85%, 80% in sequence
+       - Tries resolution scaling if size still too large
+       - NEVER fails — always sends best available quality
+
+
+12. cache_manager.py
+    -----------------
+    Role: Caches results to avoid reprocessing same invoices
+    Key: SHA-256 hash of (file bytes + extraction options)
+    Storage: uploads/.cache/{hash}.json
+    TTL: 24 hours (CACHE_MAX_AGE_HOURS in .env)
+    Instant cache hit shown as "⚡ Cached Result" in UI
+
+
+13. fetch_traces.py / fetch_traces2.py / trace_latest.py
+    -------------------------------------------------------
+    Role: LangSmith trace inspection tools
+
+    Used for debugging extraction failures:
+    fetch_traces.py   → fetches recent traces from LangSmith project
+    fetch_traces2.py  → alternative trace fetcher with filtering
+    trace_latest.py   → shows the most recent trace in detail
+
+    Traces include: full prompts sent, full AI responses received,
+    timing per pass, token usage, errors.
+
+
+14. batch_corrections.json
+    -----------------------
+    Role: Human-verified batch number correction lookup
+
+    Format: {"WRONG_BATCH": "CORRECT_BATCH", ...}
+    When AI extracts a known misread batch, this corrects it.
+    Built up over time from real invoice errors found in production.
+
+
+15. ocr_client.py
+    -------------
+    Role: (Legacy) Baidu Qianfan OCR for rotation detection
+    Currently: rotation detection uses heuristic method in preprocessing.py
+    This file is kept for reference but not in main pipeline.
+
+
+16. gst_calculator.py
     ------------------
-    Role    : Per-item GST derivation for invoices with incomplete GST columns
-    Type    : Python
-
-    Some invoices don't have per-item GST columns. This file derives the
-    missing values using whatever data is available.
-
-    enrich_item_gst() - Priority hierarchy:
-    1. Invoice has explicit CGST + SGST amounts → keep them, source = "invoice"
-    2. Has GST_AMT and Gst% → split GST_AMT into CGST+SGST (or assign to IGST)
-    3. Has Value and Gst% → calculate GST_AMT = Value × Gst% ÷ 100, then split
-    4. Nothing available → mark as "not_calculated", leave null
-
-    enrich_totals_gst()
-    - Fixes common AI mistake: AI sometimes sets total_gst_rate=5 when it
-      should be 10 (because CGST=5 and SGST=5, total=10)
-    - Corrects total_gst_rate = total_cgst_rate + total_sgst_rate
-
-    enrich_gst_comprehensive()
-    - Main entry point called by app_web.py
-    - Runs the full enrichment pipeline on the entire invoice
+    Role: GST validation following Indian GST rules
+    Intra-state: CGST = SGST (equal split)
+    Inter-state: IGST only
+    Fills missing total GST fields from item-level data.
 
 
-11. templates/index.html
+17. templates/index.html
     ---------------------
-    Role    : The complete web user interface
-    Type    : HTML + CSS + JavaScript (single file)
+    Role: Complete web UI (single file, no external dependencies)
 
-    Everything the user sees and interacts with is in this file.
-
-    Layout:
-    - Fixed header bar (title + subtitle)
-    - Two-column grid: upload panel (left) + results panel (right)
-    - Responsive: collapses to single column on smaller screens
-
-    Upload Panel features:
-    - Drag & drop zone (click or drag file onto it)
-    - Shows file name and size after selection
-    - "Cache previous results" checkbox with explanation tooltip
-    - Extract button (disabled until file selected) + Clear button
-    - Supported formats notice
-
-    Results Panel - 5 tabs:
-    Tab 1: Summary
-           - Status badges (Extraction Complete, Cached, Page Count, Time)
-           - Invoice Information card grid (number, date, PO number)
-           - Parties card grid (seller name, seller GSTIN, customer name, GSTIN)
-           - Quick Overview grid (invoice amount, total qty, item count, pages)
-
-    Tab 2: Items
-           - Full scrollable table with all line items
-           - Columns: Description, Batch, Qty, Unit Price, GST%, Amount,
-                      Item Code, HSN
-           - Free items highlighted in yellow with [FREE] badge
-
-    Tab 3: Totals
-           - Card grid showing all financial totals:
-             Invoice Amount, Taxable Amount, Total GST, GST Rate,
-             CGST Amount, CGST Rate, SGST Amount, SGST Rate,
-             IGST Amount, IGST Rate, Round Off, Discount, Total Quantity
-
-    Tab 4: JSON
-           - Syntax-highlighted raw JSON in dark theme (VS Code style)
-           - Download JSON button (saves as invoice_{number}_{timestamp}.json)
-           - Copy to Clipboard button
-
-    Tab 5: Validation
-           - Checklist: extraction success, items count, multi-page status,
-             cache status, any warnings from processing
-
-    JavaScript functions:
-    - handleFileSelect()     : Updates UI when file chosen
-    - performExtraction()    : Sends file to /api/extract, animates loading steps
-    - updateLoadingSteps()   : Animates the 4-step loading indicator
-    - displayResults()       : Renders all 5 tabs with extracted data
-    - syntaxHighlight()      : Colors JSON keys, strings, numbers, nulls
-    - displayError()         : Shows error state across all tabs
+    5-tab results layout:
+    Tab 1: Summary     — Invoice header, parties, quick overview cards
+    Tab 2: Items       — Full line items table with all fields
+    Tab 3: Totals      — All financial totals in card grid
+    Tab 4: JSON        — Syntax-highlighted raw JSON + download + copy
+    Tab 5: Validation  — Extraction status, consistency warnings, verification
 
 
-12. .env
-    ----
-    Role    : Secret configuration file (never shared or committed to Git)
-    Type    : Environment variables
+18. INVOICE_FINANCIAL_SEMANTICS_AND_REGRESSION_RULES.md
+    -----------------------------------------------------
+    Role: Permanent financial field definition reference
 
-    Contains:
-    OPENROUTER_API_KEY=sk-or-...  (your API key - keep secret)
-    MODEL_NAME=qwen/qwen2.5-vl-72b-instruct
-    CACHE_ENABLED=true
-    CACHE_MAX_AGE_HOURS=24
-    MAX_PDF_PAGES=20
-
-
-13. .env.example
-    ------------
-    Role    : Template showing what variables are needed (safe to share)
-    Type    : Environment variables template
-
-    New developers copy this file to .env and fill in their own values.
+    Documents authoritative meaning of every field:
+    - Value vs taxable_value distinction
+    - total_price semantics
+    - invoice_amount priority (TO PAY > Total Amount)
+    - round_off sign preservation
+    - null vs 0.00 semantics
+    - Known invoice patterns (regression test suite)
+    - Change log for all financial logic changes
 
 
-14. requirements.txt
-    ----------------
-    Role    : List of Python packages needed to run the project
-    Type    : Plain text
+19. PROMPT_CONTRADICTIONS_AUDIT.md
+    ---------------------------------
+    Role: Audit of identified contradictions in schema.py prompts
 
-    Install all with: pip install -r requirements.txt
-
-    Packages:
-    Flask==3.0.0            - Web framework
-    Pillow==10.4.0          - Image processing (PIL)
-    opencv-python-headless  - Image processing (rotation, contrast, skew)
-    numpy==1.26.4           - Numerical operations for image arrays
-    scipy==1.13.1           - Scientific computing (used in image analysis)
-    pymupdf==1.24.9         - PDF to image conversion
-    imagehash==4.3.1        - Perceptual image hashing
-    requests==2.32.3        - HTTP requests to OpenRouter API
-    python-dotenv==1.0.1    - Reads .env file into environment variables
-
-
-15. start.bat
-    ---------
-    Role    : One-click startup script for Windows
-    Type    : Windows batch file
-
-    Double-click this file to start the server.
-    Opens the browser automatically at http://localhost:5000
-
-
-16. README.md
-    ---------
-    Role    : Project documentation
-    Type    : Markdown
-
-
-17. .gitignore
-    ----------
-    Role    : Tells Git which files to NOT track or commit
-    Type    : Git config
-
-    Excludes: .env (secrets), uploads/, __pycache__/, .cache/
-
-
-18. uploads/ folder
-    ---------------
-    Role    : Temporary storage for uploaded files during processing
-    Contains: Uploaded invoice files + .cache/ subfolder for cached results
-
-
-19. __pycache__/ folder
-    -------------------
-    Role    : Python bytecode cache (auto-generated by Python, safe to ignore)
-    Type    : Compiled .pyc files
+    Documents:
+    - Value/taxable_value contradiction (lines 1148 vs 1422)
+    - total_price ambiguity (AMOUNT column vs final line total)
+    - Discount calculation assumptions (percent vs amount type)
+    - invoice_amount priority hierarchy
+    Status of each issue (fixed/pending/by design)
 
 
 --------------------------------------------------------------------------------
-KEY FEATURES EXPLAINED
+KEY FEATURES — DETAILED EXPLANATION
 --------------------------------------------------------------------------------
 
-FEATURE 1: 3-PASS EXTRACTION STRATEGY
----------------------------------------
-Instead of asking the AI to extract everything in one shot, the system makes
-3 focused API calls per invoice:
+FEATURE 1: 3-PASS EXTRACTION + TWO-MODEL STRATEGY
+---------------------------------------------------
+Pass 1 → Flash (header)  : invoice_number, invoice_date, customer, seller, PO
+Pass 2 → Flash (totals)  : invoice_amount, round_off, total_gst, cgst, sgst
+Pass 3 → Plus  (items)   : All line items — description, batch, qty, price, GST
+Verify → Plus  (check)   : Cross-validate extracted data vs invoice image
 
-  Pass 1 - Header fields (500 max tokens):
-  Extracts: invoice_number, invoice_date, customer_name, seller_name,
-            customer_gstin, seller_gstin, PO_number, DC_number, DC_date
-
-  Pass 2 - Financial totals (300 max tokens):
-  Extracts: invoice_amount, taxable_amount, total_gst_amount,
-            total_cgst_rate, total_cgst_amount, total_sgst_rate,
-            total_sgst_amount, round_off, total_quantity
-
-  Pass 3 - Line items (3000-4000 max tokens):
-  Extracts: Full items array with description, batch, quantity,
-            unit_price, total_price, HSN, GST%, expiry_date, etc.
-
-Why 3 passes? Accuracy improves significantly when the AI is focused on
-one task. Also, if one pass fails, the other results are still available.
+Why separate passes?
+- Each pass is focused → better accuracy than one giant prompt
+- Flash for easy fields = cost saving (13x cheaper)
+- Plus for critical batch codes = accuracy where it matters
+- If one pass fails, others still succeed
 
 
-FEATURE 2: PAGE-AGNOSTIC MULTI-PAGE EXTRACTION
-------------------------------------------------
-Old approach (wrong): Process page 1 for header, pages 2-N for items only.
-Problem: PO number on last page → missed. Totals on last page → missed.
+FEATURE 2: COPY DETECTION + DEDUPLICATION
+------------------------------------------
+Problem: A 4-page PDF is often: Original + Duplicate + Triplicate + Hospital Copy
+         All 4 pages have the same items. Without dedup, you get 40 items instead of 10.
 
-New approach (correct): Combine ALL pages into one tall vertical image.
-Send the entire document to each of the 3 passes.
-Result: AI sees complete document context for every field extraction.
-This is why PO numbers in remarks sections on any page are always found.
-
-
-FEATURE 3: FREE ITEM HANDLING
-------------------------------
-Pharmaceutical invoices show bonus quantities as "20+2" in a single cell.
-The system:
-1. AI extracts quantity as string "20+2"
-2. free_item_splitter.py splits into 2 records
-3. Paid record: qty=20, free_item_yn="0", full prices
-4. Free record:  qty=2,  free_item_yn="1", proportional prices
-5. total_quantity counts only paid items = 20
+Solution:
+- classify_copy() sends each page to model: "What copy type is this?"
+- Returns: ORIGINAL / DUPLICATE / TRIPLICATE / HOSPITAL
+- Only UNIQUE pages (typically 1-2) are sent for item extraction
+- After extraction: signature-based dedup removes remaining duplicates
+  Signature: (description + batch + quantity + unit_price)
 
 
-FEATURE 4: SMART CACHING
---------------------------
-SHA-256 hash is computed from: file bytes + extraction options
-Same invoice + same settings = same hash = instant response from cache
-Different invoice OR different options = different hash = fresh extraction
-Cache expires after 24 hours (configurable)
-Cache shown in UI as "⚡ Cached Result" badge
+FEATURE 3: CHUNKED EXTRACTION (AUTOMATIC FALLBACK)
+---------------------------------------------------
+Problem: Qwen3.7-plus stops generating JSON after ~3000 chars.
+         11-item invoice → only 4 items extracted, 7 missing.
+
+Solution (automatic, triggered only when needed):
+- Normal extraction runs first (1 API call)
+- If result has < 8 items → chunked fallback triggers automatically
+- Image split: top 55% + bottom 55% (10% overlap for safety)
+- Each chunk extracted separately (5-6 items each, fits in 3000 chars)
+- Chunk boundary: continuation hint passed for split items
+- Results merged with dedup at boundary
+- Cost: +1 API call only for large invoices
+
+Normal invoices (≤7 items): unaffected, no extra cost
 
 
-FEATURE 5: IMAGE PREPROCESSING PIPELINE
+FEATURE 4: ITEM CONTINUATION ACROSS PAGE BOUNDARIES
+----------------------------------------------------
+Problem: Item on page 1 shows description + price. Batch/Expiry printed on
+         page 2 (item row continues to next page).
+
+Solution (multi-level):
+Level 1 — Continuation hint to model:
+  Before extracting page N, tell model:
+  "Previous page ended with item 'X' (Batch=null, Expiry=null).
+   If top of this page shows Batch/Expiry for that item,
+   return it as {_continuation_for_previous_page: true, Batch: ..., Expiry: ...}"
+
+Level 2 — Continuation merge in code:
+  _is_continuation() detects rows with metadata but no description
+  Merge logic patches fields into the preceding item
+  Fields that can continue: Batch, expiry_date, item_code, hsn_sac, Pack, MRP
+
+Level 3 — Forward-look orphan patch:
+  Safety net for items where model returned continuation as a full item
+  Matches by: prior item missing Batch+Expiry+Code AND next item has them
+
+Level 4 — Chunked extraction continuation:
+  Same logic applied within a single page when chunks are used
+
+
+FEATURE 5: DESCRIPTION FIELD CLEANING
+--------------------------------------
+Problem: Some invoices print Batch/Expiry/Code below product name in same cell:
+  "SP 8747 H 1 (Centilene...) Batch : CF 289 Expiry : 30-Jun-30 OLD MRP : 31584"
+  Model dumps everything into description field.
+
+Solution (two layers):
+Layer 1 — Prompt rule (schema.py):
+  Explicit multi-line product cell rule:
+  description = first line only (product name)
+  Remaining lines → extract to Batch, expiry_date, item_code, MRP fields
+
+Layer 2 — Post-processing parser (ocr_corrector.py):
+  If description contains "Batch:", "Expiry:", "Code:", "MRP:" keywords:
+  - Regex extracts each field
+  - Fills target field ONLY if currently empty (never overwrites)
+  - Strips sub-lines from description
+  - Handles: "Batch : CF 289", "Expiry : 30-Jun-30", "Code : AL-02-1234"
+
+
+FEATURE 6: GST_AMT COMPONENT-SUM ROUNDING FIX
+-----------------------------------------------
+Problem: Bulk calculation gives different result than component sum:
+  taxable = 3987.78, GST = 5%
+  Bulk: round(3987.78 × 5%) = 199.39
+  CGST: round(3987.78 × 2.5%) = 99.69
+  SGST: round(3987.78 × 2.5%) = 99.69
+  Component sum: 99.69 + 99.69 = 199.38 ← matches actual invoice
+
+Fix: Calculate CGST and SGST first, then GST_AMT = CGST + SGST
+     Not: calculate GST_AMT first, then derive components.
+     This matches how invoice systems calculate line-by-line.
+
+
+FEATURE 7: INVOICE_AMOUNT RECONCILIATION
 -----------------------------------------
-Before sending to AI, every image goes through:
-1. Rotation detection (via Qianfan OCR model - asks "is this rotated?")
-2. Rotation correction (using OpenCV)
-3. Contrast enhancement (CLAHE algorithm - adaptive histogram equalization)
-This means even sideways, upside-down, or faded invoice scans work correctly.
+Problem: Some invoices show both "Total Amount" and "TO PAY":
+  Total Amount = 69221.18  (pre round-off subtotal)
+  Round Off    = -0.18
+  TO PAY       = 69221.00  ← this is what customer pays
+
+Model sometimes extracts Total Amount instead of TO PAY.
+
+Solution (two layers):
+Layer 1 — Prompt priority rule:
+  TO PAY > NET PAYABLE > GRAND TOTAL > Invoice Amount
+
+Layer 2 — Post-processing reconciliation (app_web.py):
+  If extracted invoice_amount + round_off = rounder number (ends in .00/.50):
+  Automatically corrects invoice_amount to the rounded value.
+  Safe: only triggers when round_off exists and difference > 1 paisa.
 
 
-FEATURE 6: JSON REPAIR
-------------------------
-Sometimes the AI returns slightly broken JSON (missing bracket, trailing comma).
-model_client.py has repair_json() that:
-- Removes trailing commas before closing brackets
-- Balances unmatched { } and [ ] brackets
-- Strips any text before { or after }
-- Converts unquoted property names to quoted
+FEATURE 8: MIXED GST SLAB HANDLING
+------------------------------------
+Problem: Invoice with items at 5% and 18% GST.
+  Old behaviour: total_gst_rate = 5 (picked first/only slab)
+  Wrong: there is no single total rate.
+
+Fix:
+  If GST summary table has multiple non-zero rate rows:
+    total_gst_rate = null
+    total_cgst_rate = null
+    total_cgst_amount = SUM of all CGST rows (from Total row of GST table)
+    total_sgst_amount = SUM of all SGST rows (from Total row of GST table)
+  Single-slab invoices: unchanged behaviour.
+
+
+FEATURE 9: LANGSMITH TRACING
+------------------------------
+Every extraction creates a trace in LangSmith project "invoice-extractor".
+Each trace shows:
+- All 3-4 API calls with full prompts and responses
+- Token usage per pass
+- Timing per pass
+- OCR corrections applied
+- GST enrichment decisions
+- Consistency check results
+
+Use fetch_traces.py or trace_latest.py to inspect failures.
+LANGCHAIN_API_KEY set in .env.
+
+
+FEATURE 10: SMART CACHING
+---------------------------
+SHA-256 hash: file bytes + extraction options
+Same invoice + same settings → instant cache hit (no API calls)
+Cache stored in uploads/.cache/{hash}.json
+TTL: 24 hours (configurable)
+Shown in UI as "⚡ Cached Result" badge
+
+
+--------------------------------------------------------------------------------
+FINANCIAL FIELD SEMANTICS (AUTHORITATIVE DEFINITIONS)
+--------------------------------------------------------------------------------
+
+  Value           : Gross line amount BEFORE discount (qty × rate)
+  taxable_value   : Net taxable amount AFTER discount, BEFORE GST
+  total_price     : Final line total INCLUDING GST
+  invoice_amount  : Final amount customer must pay (= TO PAY on invoice)
+  GST_AMT         : CGST + SGST + IGST for one line item
+  round_off       : Signed rounding adjustment (can be + or -)
+
+  Value ≠ taxable_value (except when invoice has no discount)
+  invoice_amount ≠ "Total Amount" (when round_off exists)
+
+  null vs "0.00":
+    null   = field not applicable / not present in invoice
+    "0.00" = explicitly zero monetary total
 
 
 --------------------------------------------------------------------------------
@@ -560,121 +638,172 @@ JSON OUTPUT STRUCTURE
 --------------------------------------------------------------------------------
 
 {
-  "invoice_id"         : "INV001",
-  "invoice_number"     : "INV001",
-  "invoice_date"       : "15/06/2026",
-  "due_date"           : null,
-  "customer_name"      : "DEENANATH MANGESHKAR HOSPITAL",
-  "customer_gstin"     : "27AIWPA8054A1ZA",
-  "seller_name"        : "MEHTA PHARMA PVT LTD",
-  "seller_gstin"       : "27AAAFM1944N1ZN",
-  "currency_code"      : "INR",
-  "PO_number"          : "DMH/PO/PHRMCY/2026-27/3906",
-  "DC_date"            : null,
-  "DC_number"          : null,
-  "invoice_amount"     : 15420.50,
-  "round_off"          : -0.50,
-  "total_gst_rate"     : 12,
-  "total_quantity"     : 150,
-  "total_cgst_rate"    : 6,
-  "total_cgst_amount"  : 825.00,
-  "total_sgst_rate"    : 6,
-  "total_sgst_amount"  : 825.00,
-  "total_igst_rate"    : null,
-  "total_igst_amount"  : 0,
-  "total_gst_amount"   : 1650.00,
+  "invoice_id"          : "INV001",
+  "invoice_number"      : "INV001",
+  "invoice_date"        : "15/06/2026",
+  "due_date"            : null,
+  "customer_name"       : "DEENANATH MEDICAL STORES",
+  "customer_gstin"      : "27AAATL1944N1ZA",
+  "seller_name"         : "MEHTA PHARMA PVT LTD",
+  "seller_gstin"        : "27AAAFM1944N1ZN",
+  "currency_code"       : "INR",
+  "PO_number"           : "DMH/PO/phrmcy/2026-27/12152",
+  "DC_date"             : null,
+  "DC_number"           : null,
+  "invoice_amount"      : "15420.00",
+  "round_off"           : "-0.50",
+  "total_gst_rate"      : 5,
+  "total_quantity"      : 150,
+  "total_cgst_rate"     : 2.5,
+  "total_cgst_amount"   : "385.50",
+  "total_sgst_rate"     : 2.5,
+  "total_sgst_amount"   : "385.50",
+  "total_igst_rate"     : null,
+  "total_igst_amount"   : "0.00",
+  "total_gst_amount"    : "771.00",
   "items": [
     {
-      "description"    : "PARACETAMOL 500MG",
-      "Pack"           : "10TAB",
-      "Batch"          : "AB1234",
-      "quantity"       : 20,
-      "free_item_yn"   : "0",
-      "unit_price"     : 48.71,
-      "total_price"    : 974.20,
+      "description"     : "PARACETAMOL 500MG",
+      "Pack"            : "10TAB",
+      "Batch"           : "AB1234",
+      "quantity"        : 20,
+      "free_item_yn"    : "0",
+      "unit_price"      : "48.71",
+      "total_price"     : "974.20",
       "reference_number": null,
-      "hsn_sac"        : "30049099",
-      "item_code"      : "SR-02-0391",
-      "expiry_date"    : "30/11/2027",
-      "Discount"       : 5.0,
-      "Discount_type"  : "percent",
-      "Value"          : 925.49,
-      "Gst%"           : 12,
-      "MRP"            : 60.00,
-      "cgst_rate"      : 6,
-      "cgst_amount"    : 55.53,
-      "sgst_rate"      : 6,
-      "sgst_amount"    : 55.53,
-      "igst_rate"      : null,
-      "igst_amount"    : null,
-      "GST_AMT"        : 111.06,
-      "taxable_value"  : 925.49
+      "hsn_sac"         : "30049099",
+      "item_code"       : "SR-02-0391",
+      "expiry_date"     : "30/11/2027",
+      "Discount"        : "5.00",
+      "Discount_type"   : "percent",
+      "Value"           : "974.20",
+      "Gst%"            : 5,
+      "MRP"             : "60.00",
+      "cgst_rate"       : 2.5,
+      "cgst_amount"     : "22.76",
+      "sgst_rate"       : 2.5,
+      "sgst_amount"     : "22.76",
+      "igst_rate"       : null,
+      "igst_amount"     : null,
+      "GST_AMT"         : "45.52",
+      "taxable_value"   : 925.49
     }
   ]
 }
+
+Note: invoice_amount, total_*_amount are kept as strings.
+      taxable_value, Gst%, cgst_rate, sgst_rate are numbers.
+      GST_AMT is a string.
+
+
+--------------------------------------------------------------------------------
+KNOWN VENDOR PATTERNS (REGRESSION TEST SUITE)
+--------------------------------------------------------------------------------
+
+PATTERN 1: Nitin Agency (Discount + Round-off)
+  AMOUNT = gross before discount → Value
+  DISCOUNT % applied → taxable_value
+  CGST + SGST on taxable
+  Invoice Amt = intermediate subtotal
+  Round Off = +0.07
+  TOPAY = final payable → invoice_amount
+
+PATTERN 2: Medica (Multiple discounts)
+  Multiple discount components (TD, CD, Scheme)
+  TAXABLE column printed → use directly, never reconstruct from discounts
+  
+PATTERN 3: Tapadiya C/6636 (GST rounding + TO PAY)
+  AMOUNT = gross, Discount % → TAXABLE
+  line-by-line CGST/SGST rounding
+  Total Amount = 59727.73
+  Round Off = +0.27
+  TO PAY = 59728.00 → invoice_amount
+
+PATTERN 4: Kundan KP26264882 (Mixed GST slabs)
+  Items at 5% GST and items at 18% GST
+  total_gst_rate = null (no single rate)
+  total_cgst_amount = 1510.04 (from Total row of GST table)
+  total_sgst_amount = 1510.04
+
+PATTERN 5: Matrix Biomedics MW-2627/08031 (Multi-line product cell)
+  Product cell: product name + Batch + Expiry + Code + OLD MRP
+  description = product name only
+  Other sub-lines → correct fields
+
+PATTERN 6: Progress Healthcare 2026-27/P/4469 (11 items, chunked extraction)
+  11 items → triggers chunked extraction automatically
+  All items extracted via 2-chunk strategy
+  Catalog numbers in description cell → parsed out
+
+PATTERN 7: New Salakshmi NS/8440 (CD% column discount)
+  DISC column = 5% for all items
+  TAXABLE column printed
+  All taxable values: AMOUNT × (1 - 0.05) = TAXABLE ✓
+
+
+--------------------------------------------------------------------------------
+KNOWN ISSUES / FUTURE RISKS
+--------------------------------------------------------------------------------
+
+1. MULTIPLE DISCOUNTS IN ONE FIELD
+   Some invoices have TD%, CD%, Scheme% as separate columns.
+   Current schema has one Discount field.
+   Safe mitigation: If TAXABLE column printed, trust it (never reconstruct).
+
+2. EXTRA CHARGES NOT IN SCHEMA
+   Freight, Packing, TCS, CN/DN amounts affect final total.
+   Current schema extracts invoice_amount as final payable (handles it).
+   But individual extra-charge fields not captured.
+
+3. VALUE vs TAXABLE_VALUE CONTRADICTION IN PROMPT
+   Schema.py lines 1148 vs 1422 have conflicting rules.
+   Line 1148: "Never copy taxable_value into Value"
+   Line 1422: "Copy TAXABLE to BOTH Value and taxable_value"
+   Documented in PROMPT_CONTRADICTIONS_AUDIT.md.
+   Not yet fixed — requires careful regression testing.
+
+4. CHUNKED EXTRACTION FOR > 15 ITEMS
+   If an invoice has 20+ items, even chunked (2 chunks) may not be enough.
+   Future fix: 3-chunk strategy or dynamic chunk count based on image height.
+
+5. MIXED GST + DISCOUNT
+   Invoice with both multiple GST slabs AND multiple discount types
+   not yet seen in production. May require special handling.
 
 
 --------------------------------------------------------------------------------
 HOW TO RUN THE PROJECT
 --------------------------------------------------------------------------------
 
-Step 1: Install Python 3.11+
+Step 1: Python 3.11+ installed
 
-Step 2: Install dependencies
-        pip install -r requirements.txt
+Step 2: pip install -r requirements.txt
 
-Step 3: Set up API key
-        Copy .env.example to .env
-        Add your OpenRouter API key: OPENROUTER_API_KEY=sk-or-xxxxx
-        Get key from: https://openrouter.ai/keys
+Step 3: Copy .env.example to .env
+        Fill in: OPENROUTER_API_KEY=sk-or-xxxxx
+        Optionally: MODEL_NAME, FAST_MODEL_NAME, LANGCHAIN_API_KEY
 
-Step 4: Start server
-        Double-click start.bat   (Windows)
-        OR run: python app_web.py
+Step 4: python app_web.py
+        (Or double-click start.bat on Windows)
 
-Step 5: Open browser
-        Go to: http://localhost:5000
+Step 5: Open http://localhost:8001
 
-Step 6: Upload invoice
-        Drag & drop or click to upload PDF/image
-        Click "Extract Data"
-        View results in 5 tabs
+Step 6: Upload invoice PDF or image, click Extract Data
 
 
 --------------------------------------------------------------------------------
 API ENDPOINTS
 --------------------------------------------------------------------------------
 
-GET  /
-     Serves the web interface (index.html)
-
 POST /api/extract
-     Extracts data from uploaded invoice
-     Form fields:
-       file       : The invoice file (PDF/image)
-       use_ocr    : "true" / "false" (always true in current UI)
-       two_pass   : "true" / "false" (always true in current UI)
-       multi_page : "true" / "false" (always true in current UI)
-       use_cache  : "true" / "false" (from checkbox in UI)
-     Returns: JSON with success, data, metadata, reasoning
+  Form fields: file, use_ocr, two_pass, multi_page, use_cache
+  Returns: {success, data, metadata, reasoning}
 
-GET  /api/health
-     Returns API configuration status
-     Used by UI on load to check if API key is set
+GET /api/health
+  Returns: {status, api_key_configured, model}
 
-
---------------------------------------------------------------------------------
-SUPPORTED INPUT FORMATS
---------------------------------------------------------------------------------
-
-  PDF   - Single or multi-page (up to 20 pages)
-  JPG   - Standard JPEG images
-  PNG   - PNG images
-  TIFF  - TIFF images (common in scanners)
-  BMP   - Bitmap images
-  WebP  - Modern web image format
-
-Maximum file size: 20 MB
+GET /
+  Serves web UI (index.html)
 
 
 --------------------------------------------------------------------------------
@@ -683,30 +812,88 @@ PROJECT FOLDER STRUCTURE
 
 invoice-extractor/
 |
-|-- app_web.py              Main Flask server
-|-- schema.py               AI prompts and extraction rules
-|-- model_client.py         OpenRouter API communication
-|-- ocr_client.py           Qianfan OCR for rotation detection
-|-- pdf_utils.py            PDF to image conversion
-|-- preprocessing.py        Image cleaning pipeline
-|-- cache_manager.py        Result caching system
-|-- free_item_splitter.py   Free/bonus item splitting
-|-- gst_calculator.py       GST validation and enrichment
-|-- gst_enrichment.py       Per-item GST derivation
+|-- app_web.py                           Main Flask server (port 8001)
+|-- schema.py                            AI prompt rulebook
+|-- model_client.py                      OpenRouter API client + extraction logic
+|-- ocr_corrector.py                     Deterministic post-extraction fixes
+|-- gstin_validator.py                   GSTIN validation + hardcode overrides
+|-- seller_gstin_lookup.py               Seller GSTIN lookup table
+|-- gst_enrichment.py                    Per-item GST derivation
+|-- gst_calculator.py                    GST validation (Indian GST rules)
+|-- consistency_checker.py               Financial cross-validation
+|-- free_item_splitter.py                Splits "20+2" free item quantities
+|-- preprocessing.py                     Image cleaning pipeline
+|-- pdf_utils.py                         PDF to image conversion
+|-- cache_manager.py                     SHA-256 file-based result cache
+|-- ocr_client.py                        (Legacy) Qianfan OCR client
+|-- batch_corrections.json               Human-verified batch number fixes
+|
+|-- fetch_traces.py                      LangSmith trace inspector
+|-- fetch_traces2.py                     Alternative trace fetcher
+|-- trace_latest.py                      Show most recent trace
 |
 |-- templates/
-|   |-- index.html          Complete web UI
+|   |-- index.html                       Complete web UI (5-tab layout)
 |
-|-- uploads/                Temporary uploaded files
-|   |-- .cache/             Cached extraction results (JSON files)
+|-- uploads/                             Uploaded invoice files (temp)
+|   |-- .cache/                          Cached extraction results
 |
-|-- .env                    Secret config (API key) - never share
-|-- .env.example            Config template - safe to share
-|-- requirements.txt        Python package list
-|-- start.bat               One-click Windows startup
-|-- README.md               Documentation
-|-- .gitignore              Git exclusions
-|-- __pycache__/            Python bytecode (auto-generated)
+|-- .env                                 Secrets (API keys) — never commit
+|-- .env.example                         Config template — safe to share
+|-- requirements.txt                     Python package list
+|-- start.bat                            Windows one-click startup
+|
+|-- INVOICE_FINANCIAL_SEMANTICS_AND_REGRESSION_RULES.md
+|-- PROMPT_CONTRADICTIONS_AUDIT.md
+|-- CHANGELOG_GPT_RECOMMENDATIONS.md
+|-- ITEM_CODE_CORRECTIONS_GUIDE.md
+|-- ITEM_CODE_FIX_SUMMARY.md
+|-- NEW_PATTERNS_FROM_TAPADIA_MILTON.md
+|-- PROJECT_EXPLANATION.txt              This file
+
+
+--------------------------------------------------------------------------------
+CHANGE HISTORY (RECENT SESSIONS)
+--------------------------------------------------------------------------------
+
+[Aug 2026] DESCRIPTION FIELD PARSING
+  Bug: Multi-line product cells dumped Batch/Expiry/Code into description.
+  Fix: Prompt rule + post-processing regex parser in ocr_corrector.py.
+
+[Aug 2026] GST_AMT COMPONENT ROUNDING FIX
+  Bug: GST_AMT calculated as round(taxable × rate%), CGST+SGST differed by ₹0.01.
+  Fix: Calculate CGST+SGST first, GST_AMT = component sum.
+  File: gst_enrichment.py
+
+[Aug 2026] INVOICE_AMOUNT TO PAY PRIORITY
+  Bug: Model extracted "Total Amount" instead of "TO PAY".
+  Fix 1: Prompt priority rule (schema.py).
+  Fix 2: Post-processing reconciliation in app_web.py.
+
+[Aug 2026] MIXED GST SLAB HANDLING
+  Bug: total_gst_rate set to single rate even when invoice has 5% + 18%.
+  Fix: Prompt rule — null rate when multiple slabs, sum amounts from Total row.
+  File: schema.py
+
+[Aug 2026] TWO-MODEL STRATEGY
+  Added Flash model for header/totals (cheaper, fast).
+  Plus model retained for items (accurate, handles batch codes).
+  File: model_client.py
+
+[Aug 2026] CHUNKED EXTRACTION
+  Bug: 11-item invoice truncated to 4 items (model hit output limit).
+  Fix: Automatic chunked fallback when < 8 items extracted.
+       Splits image in half, extracts each chunk, merges with continuation.
+  File: model_client.py, _extract_items_chunked()
+
+[Aug 2026] max_tokens INCREASE
+  Items pass: 8000 → 16000 tokens for large invoices.
+  File: model_client.py
+
+[Aug 2026] None SAFETY FIX IN CHUNKED EXTRACTION
+  Bug: item.get('Batch', '') returns None when value is None → crash on .strip()
+  Fix: Changed all .get() calls to str(item.get('field') or '').strip()
+  File: model_client.py, _extract_items_chunked()
 
 
 --------------------------------------------------------------------------------

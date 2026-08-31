@@ -19,33 +19,28 @@ load_dotenv()
 #  VERIFICATION PROMPT — post-extraction accuracy check
 # ════════════════════════════════════════════════════════════════════════════════
 
-VERIFICATION_SYSTEM_PROMPT = """You are an invoice verification specialist. Your job: compare extracted JSON data against the source invoice image and flag discrepancies.
+VERIFICATION_SYSTEM_PROMPT = """You are an invoice verification specialist. Compare extracted JSON data against the source invoice image and flag ONLY real discrepancies.
 
-VERIFICATION RULES:
-1. Compare EVERY numeric field (quantities, prices, amounts, GST rates) against the printed invoice.
-2. Check item codes, batch numbers, HSN codes character-by-character.
-3. Verify GSTIN format (15 chars, correct pattern).
-4. Check invoice-level totals: sum(item amounts) + GST = invoice_amount.
-5. Flag mismatches, not minor OCR variants (e.g., "O" vs "0" in batch numbers is fine if semantically correct).
+RULES:
+1. Flag ONLY fields where the extracted value differs from what is printed on the invoice.
+2. DO NOT flag fields that match. DO NOT add explanatory notes for matching fields.
+3. DO NOT include a "note" field in any discrepancy object — only field/extracted/invoice_shows/severity.
+4. Check: invoice_number, amounts, quantities, GST values, batch numbers, descriptions.
+5. Skip minor OCR variants that are semantically identical.
 
-OUTPUT FORMAT:
+OUTPUT FORMAT — strict, compact, no extra fields:
 {
   "verification_status": "PASS" or "FAIL",
   "discrepancies": [
-    {"field": "item[0].quantity", "extracted": "20", "invoice_shows": "22", "severity": "high"},
-    {"field": "customer_gstin", "extracted": "27AABCS1234N1ZA", "invoice_shows": "27AABCS1234N1Z5", "severity": "critical"}
+    {"field": "item[0].Batch", "extracted": "ABVG0002", "invoice_shows": "ABWG0002", "severity": "medium"},
+    {"field": "invoice_number", "extracted": "CG-1472", "invoice_shows": "CC-1472", "severity": "critical"}
   ],
-  "confidence_score": 0.95,
-  "notes": "All header fields match. Item 3 unit_price differs by ₹0.50 (possible OCR error in decimal point)."
+  "confidence_score": 0.95
 }
 
-severity levels:
-- "critical": GSTIN, invoice_number, invoice_amount wrong
-- "high": item quantity, price, GST amount wrong
-- "medium": batch number, HSN code, item code wrong
-- "low": Pack, MRP, minor description variant
-
-Be strict. If extraction is perfect, return empty discrepancies array and status="PASS"."""
+severity: critical=invoice_number/GSTIN/amount, high=quantity/price/GST, medium=batch/HSN/code, low=description/Pack
+If extraction is perfect: discrepancies=[] and status="PASS".
+ONLY output JSON. No markdown. No explanation outside the JSON."""
 
 VERIFICATION_USER_PROMPT = """Here is the extracted JSON from this invoice. Verify it against the image:
 
@@ -912,6 +907,131 @@ class OpenRouterClient:
         ]
         return "\n".join(lines)
 
+    def _extract_items_chunked(
+        self,
+        page_img: Image.Image,
+        items_system: str,
+        base_items_prompt: str,
+        temperature: float
+    ) -> list:
+        """
+        Fallback: extract items in spatial chunks when full-page extraction
+        hits output token limit.
+        
+        Strategy: Split image vertically, extract top half then bottom half,
+        merge results with deduplication at the split boundary.
+        
+        IMPORTANT: Preserves continuation logic — if top chunk's last item is
+        incomplete, bottom chunk extraction receives continuation hint.
+        
+        Only called when truncation detected (few items extracted but more exist).
+        """
+        width, height = page_img.size
+        
+        # Split into top 60% and bottom 60% (20% overlap to catch split rows)
+        split_point = int(height * 0.5)
+        overlap = int(height * 0.1)
+        
+        top_chunk = page_img.crop((0, 0, width, split_point + overlap))
+        bottom_chunk = page_img.crop((0, split_point - overlap, width, height))
+        
+        print(f"      📐 Top chunk: {top_chunk.size}, Bottom chunk: {bottom_chunk.size}")
+        
+        # Extract top half
+        top_prompt = base_items_prompt + "\n\nExtract items from the TOP HALF of this table."
+        top_data, _ = self.extract_invoice(
+            top_chunk, items_system, top_prompt,
+            temperature=temperature, max_tokens=8000, use_reasoning=True
+        )
+        
+        top_items = top_data.get('items', []) if 'items' in top_data else []
+        print(f"      ✅ Top chunk: {len(top_items)} items")
+        
+        # ── Continuation hint for bottom chunk ──────────────────────
+        # If top chunk's last item is incomplete, tell bottom chunk about it
+        bottom_prompt = base_items_prompt + "\n\nExtract items from the BOTTOM HALF of this table."
+        
+        if top_items:
+            last_item = top_items[-1]
+            # Check if last item is potentially incomplete (missing batch/expiry)
+            missing_batch = not str(last_item.get('Batch') or '').strip()
+            missing_expiry = not str(last_item.get('expiry_date') or '').strip()
+            
+            if missing_batch or missing_expiry:
+                prev_desc = last_item.get('description', '')[:60]
+                prev_batch = last_item.get('Batch') or 'null'
+                prev_exp = last_item.get('expiry_date') or 'null'
+                prev_code = last_item.get('item_code') or 'null'
+                
+                continuation_hint = (
+                    f"\n\n⚠️ CHUNK BOUNDARY — CONTINUATION CHECK:\n"
+                    f"The previous chunk ended with item '{prev_desc}' which may be INCOMPLETE.\n"
+                    f"Current data: Batch={prev_batch}, Expiry={prev_exp}, Code={prev_code}\n\n"
+                    f"If the TOP of this chunk shows continuation data for that item\n"
+                    f"(batch/expiry/code without a new product description),\n"
+                    f"return it as the FIRST item with {{\"_continuation_for_previous_page\": true}}\n"
+                )
+                bottom_prompt += continuation_hint
+                print(f"      🔗 Continuation hint added for: {prev_desc[:40]}")
+        
+        # Extract bottom half
+        bottom_data, _ = self.extract_invoice(
+            bottom_chunk, items_system, bottom_prompt,
+            temperature=temperature, max_tokens=8000, use_reasoning=True
+        )
+        
+        bottom_items = bottom_data.get('items', []) if 'items' in bottom_data else []
+        print(f"      ✅ Bottom chunk: {len(bottom_items)} items")
+        
+        # Merge with continuation handling (same logic as multi-page merge)
+        merged = top_items.copy()
+        
+        if bottom_items:
+            # Check if first bottom item is a continuation
+            first_bot = bottom_items[0]
+            is_continuation = (
+                first_bot.get('_continuation_for_previous_page') or
+                (not str(first_bot.get('description') or '').strip() and
+                 any([first_bot.get('Batch'), first_bot.get('expiry_date'), first_bot.get('item_code')]))
+            )
+            
+            if is_continuation and merged:
+                # Merge continuation data into last top item
+                last_top = merged[-1]
+                for field in ['Batch', 'expiry_date', 'item_code', 'hsn_sac', 'Pack', 'MRP']:
+                    val = first_bot.get(field)
+                    if val and str(val).strip() and not last_top.get(field):
+                        last_top[field] = val
+                print(f"      🔗 Continuation merged into: {last_top.get('description', '')[:40]}")
+                # Skip first bottom item (it was merged)
+                bottom_items = bottom_items[1:]
+            
+            # Deduplicate remaining items at boundary
+            if bottom_items and merged:
+                last_top_keys = {
+                    (str(item.get('description') or '').strip(), str(item.get('Batch') or '').strip())
+                    for item in merged[-2:]
+                }
+                
+                skip_count = 0
+                for idx, bot_item in enumerate(bottom_items):
+                    bot_key = (
+                        str(bot_item.get('description') or '').strip(),
+                        str(bot_item.get('Batch') or '').strip()
+                    )
+                    if bot_key in last_top_keys and idx < 2:
+                        skip_count += 1
+                        print(f"      Skipping duplicate: {str(bot_item.get('description') or '')[:40]}")
+                    else:
+                        merged.append(bot_item)
+                
+                if skip_count == 0 and not is_continuation:
+                    print(f"      ℹ️  No duplicates at chunk boundary")
+            else:
+                merged.extend(bottom_items)
+        
+        return merged
+
     @traceable(name="model_extract_multipage", tags=["model", "extraction", "multi-page"])
     def extract_invoice_multipage(
         self,
@@ -1265,7 +1385,7 @@ class OpenRouterClient:
             page_items_data, page_items_response = self.extract_invoice(
                 page_img, items_system, items_user_with_context,
                 temperature=temperature,
-                max_tokens=8000
+                max_tokens=16000  # Increased from 8000: large tables need more tokens
             )
             items_responses[f'page_{pg_idx + 1}'] = page_items_response
 
@@ -1274,6 +1394,42 @@ class OpenRouterClient:
                 continue
 
             page_items = page_items_data.get('items', [])
+            
+            # ── CHUNKED EXTRACTION FALLBACK ──────────────────────────────
+            # Only triggers when model hit output limit (truncation).
+            # CRITICAL: Do NOT trigger on continuation pages (page 2 with
+            # only batch/expiry data). Signs it's a continuation page:
+            #   - Few items extracted (1-2) on a non-first page
+            #   - Previous page had items (meaning this is page 2+)
+            #   - Items have no description (pure metadata continuation rows)
+            # Only trigger if: page 1 AND < 8 items, OR later page has
+            # 0 items extracted at all (complete failure, not continuation).
+            is_first_page = (pg_idx == 0)
+            all_items_have_no_desc = all(
+                not str(it.get('description') or '').strip()
+                for it in page_items
+            ) if page_items else False
+            
+            should_chunk = (
+                is_first_page and len(page_items) < 8
+            ) or (
+                not is_first_page and len(page_items) == 0
+            )
+            
+            if should_chunk:
+                print(f"   ⚠️  Only {len(page_items)} items extracted — checking if more exist...")
+                
+                # Re-extract with chunked approach: top half + bottom half
+                print(f"   🔄 Attempting chunked extraction (2 passes)...")
+                chunk_items = self._extract_items_chunked(
+                    page_img, items_system, base_items_prompt, temperature
+                )
+                if len(chunk_items) > len(page_items):
+                    print(f"   ✅ Chunked extraction recovered {len(chunk_items)} items (vs {len(page_items)} original)")
+                    page_items = chunk_items
+                else:
+                    print(f"   ℹ️  Chunked extraction didn't improve ({len(chunk_items)} vs {len(page_items)})")
+            
             print(f"   ✅ Page {pg_idx + 1}: {len(page_items)} items extracted")
             # Tag every item with its source page index so the recheck pass
             # can later route each item to the correct page image.
@@ -1503,6 +1659,83 @@ class OpenRouterClient:
 
         duplicate_count = len(all_items) - len(deduped_items)
         all_items = deduped_items
+
+        # ════════════════════════════════════════════════════════════
+        # LAYER 2 + 3: ITEM COUNT COMPLETENESS CHECK
+        # ────────────────────────────────────────────────────────────
+        # Uses expected_item_count (T.Prod) from the totals pass to
+        # verify we have all items. If short, triggers recovery.
+        # ════════════════════════════════════════════════════════════
+        expected_count = None
+        try:
+            raw_expected = merged_data.get('expected_item_count')
+            if raw_expected is not None:
+                expected_count = int(float(str(raw_expected)))
+        except (ValueError, TypeError):
+            pass
+
+        if expected_count and expected_count > 0:
+            got_count = len([it for it in all_items if str(it.get('description') or '').strip()])
+            print(f"\n[count-check] Expected items: {expected_count}  Got: {got_count}")
+
+            if got_count < expected_count:
+                print(f"[count-check] ⚠️  MISSING {expected_count - got_count} item(s) — triggering recovery")
+
+                # Build a combined image of ALL unique pages for recovery pass
+                # Use same approach as header/totals: send all pages as list
+                recovery_img = unique_images[0] if len(unique_images) == 1 else unique_images
+
+                items_system, _ = get_items_prompt()
+                recovery_prompt = (
+                    base_items_prompt +
+                    f"\n\n⚠️⚠️⚠️ COMPLETENESS ALERT:\n"
+                    f"This invoice has EXACTLY {expected_count} line items (confirmed by T.Prod field).\n"
+                    f"Previous extraction only found {got_count} items.\n"
+                    f"Items already found:\n" +
+                    "\n".join(
+                        f"  - {it.get('description', '?')[:50]} "
+                        f"(Batch={it.get('Batch','?')}, Qty={it.get('quantity','?')})"
+                        for it in all_items
+                        if str(it.get('description') or '').strip()
+                    ) +
+                    f"\n\nSCAN THE ENTIRE DOCUMENT CAREFULLY.\n"
+                    f"Find the {expected_count - got_count} MISSING item(s) not listed above.\n"
+                    f"Return ALL {expected_count} items including the already-found ones.\n"
+                    f"DO NOT skip any product row even if it spans a page boundary.\n"
+                )
+
+                recovery_data, _ = self.extract_invoice(
+                    recovery_img, items_system, recovery_prompt,
+                    temperature=0.0, max_tokens=16000, use_reasoning=True
+                )
+
+                recovery_items = recovery_data.get('items', []) if 'items' in recovery_data else []
+                print(f"[count-check] Recovery extracted {len(recovery_items)} items")
+
+                if len(recovery_items) >= got_count:
+                    # Recovery found at least as many — use recovery result
+                    # but run dedup again to be safe
+                    print(f"[count-check] ✅ Using recovery items ({len(recovery_items)} >= {got_count})")
+                    all_items = recovery_items
+                    # Quick dedup pass on recovery items
+                    seen_r: set = set()
+                    deduped_r = []
+                    for it in all_items:
+                        d = str(it.get('description') or '').strip().upper()
+                        b = str(it.get('Batch') or '').strip().upper()
+                        q = str(it.get('quantity') or '')
+                        k = (d, b, q)
+                        if k not in seen_r:
+                            seen_r.add(k)
+                            deduped_r.append(it)
+                    all_items = deduped_r
+                    print(f"[count-check] After recovery dedup: {len(all_items)} items")
+                else:
+                    print(f"[count-check] ⚠️  Recovery still short ({len(recovery_items)} < {got_count}), keeping original")
+            else:
+                print(f"[count-check] ✅ Item count matches ({got_count}/{expected_count})")
+        else:
+            print(f"[count-check] No T.Prod count available — skipping count verification")
 
         # ── Write final items and summary ─────────────────────────
         print(f"\n[multipage] Finalising items...")
@@ -1835,14 +2068,14 @@ class OpenRouterClient:
         
         user_prompt = VERIFICATION_USER_PROMPT.format(extracted_json=extracted_json)
         
-        # Cheap verification call: no reasoning (pure comparison), low token limit
+        # Verification call: no reasoning, compact output
         verification_result, _ = self.extract_invoice(
             image,
             system_prompt=VERIFICATION_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             temperature=0.0,
-            max_tokens=2000,
-            use_reasoning=False  # No thinking needed — just compare two sources
+            max_tokens=4000,
+            use_reasoning=False
         )
         
         # Default to PASS if model returns empty/malformed verification

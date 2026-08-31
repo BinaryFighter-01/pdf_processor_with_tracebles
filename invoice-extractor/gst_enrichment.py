@@ -144,14 +144,52 @@ def enrich_item_gst(item: Dict[str, Any], is_intra_state: bool = True) -> Dict[s
                 (sgst_amt_existing or 0) +
                 (igst_amt_existing or 0)
             )
-        # Ensure taxable_value is present using the item's own printed value.
-        # DO NOT derive from Value-Discount here — that produces wrong numbers
-        # when the invoice shows a post-discount taxable directly.
-        if item.get('taxable_value') is None:
-            # Try the existing fields in priority order
-            tv = _to_float(item.get('taxable_value')) or _to_float(item.get('Value'))
-            if tv:
-                item['taxable_value'] = tv
+        # ── Taxable value verification and correction ─────────────────────
+        # The model often copies the gross Value column into taxable_value,
+        # ignoring the discount. We verify using the cross-check:
+        #   taxable_value × GST% ≈ GST_AMT
+        # If the current taxable_value fails this check but Value-Discount passes,
+        # we correct it deterministically — no API call needed.
+        current_tv = _to_float(item.get('taxable_value'))
+        gross_value = _to_float(item.get('Value'))
+        gst_amt_val = _to_float(item.get('GST_AMT')) or (
+            (cgst_amt_existing or 0) + (sgst_amt_existing or 0) + (igst_amt_existing or 0)
+        )
+
+        if gst_percent and gst_percent > 0 and gst_amt_val and gst_amt_val > 0:
+            if current_tv is None:
+                # taxable_value missing — try Value - Discount first, then Value
+                discount_pct = _to_float(item.get('Discount'))
+                if gross_value and discount_pct and discount_pct > 0:
+                    disc_amt = round_to_2(gross_value * discount_pct / 100)
+                    tv_candidate = round_to_2(gross_value - disc_amt)
+                else:
+                    tv_candidate = gross_value
+                if tv_candidate:
+                    item['taxable_value'] = tv_candidate
+                    current_tv = tv_candidate
+            else:
+                # taxable_value is set — verify it against GST_AMT
+                expected_gst = round_to_2(current_tv * gst_percent / 100)
+                tolerance = 0.05  # allow up to 5 paisa rounding difference
+                if abs(expected_gst - gst_amt_val) > tolerance:
+                    # Cross-check failed — model likely copied gross Value
+                    # Try Value - Discount as the corrected taxable
+                    discount_pct = _to_float(item.get('Discount'))
+                    if gross_value and discount_pct and discount_pct > 0:
+                        disc_amt = round_to_2(gross_value * discount_pct / 100)
+                        tv_corrected = round_to_2(gross_value - disc_amt)
+                        expected_gst_corrected = round_to_2(tv_corrected * gst_percent / 100)
+                        if abs(expected_gst_corrected - gst_amt_val) <= tolerance:
+                            print(f"[GST] taxable_value corrected: "
+                                  f"{current_tv} -> {tv_corrected} "
+                                  f"(Value {gross_value} - Discount {discount_pct}% = {tv_corrected})")
+                            item['taxable_value'] = tv_corrected
+                            item['Value'] = gross_value  # preserve gross as Value
+        elif current_tv is None and gross_value:
+            # No GST to cross-check — fall back to Value
+            item['taxable_value'] = gross_value
+
         item['_gst_source'] = 'invoice'
         return item
 
@@ -179,7 +217,6 @@ def enrich_item_gst(item: Dict[str, Any], is_intra_state: bool = True) -> Dict[s
         return item
 
     gst_amt = round_to_2(taxable_value * gst_percent / 100)
-    item['GST_AMT'] = gst_amt
 
     if is_intra_state:
         cgst_rate = cgst_rate_existing if cgst_rate_existing is not None else round_to_2(gst_percent / 2)
@@ -190,6 +227,12 @@ def enrich_item_gst(item: Dict[str, Any], is_intra_state: bool = True) -> Dict[s
         item['sgst_amount'] = round_to_2(taxable_value * sgst_rate / 100)
         item['igst_rate']   = None
         item['igst_amount'] = None
+        # Recalculate GST_AMT as component sum to avoid rounding mismatch
+        # Example: taxable=3987.78, rate=5%
+        #   Direct: round(3987.78 × 5%) = 199.39
+        #   Components: round(3987.78 × 2.5%) = 99.69 per component → 99.69 + 99.69 = 199.38
+        # Component sum is correct because that's how invoice calculates line-by-line
+        item['GST_AMT'] = round_to_2(item['cgst_amount'] + item['sgst_amount'])
     else:
         igst_rate = igst_rate_existing if igst_rate_existing is not None else gst_percent
         item['igst_rate']   = igst_rate
