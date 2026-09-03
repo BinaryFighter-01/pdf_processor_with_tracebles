@@ -326,7 +326,7 @@ def extract_invoice():
                 do_deskew=False,     # ❌ DISABLED — Hough picks table lines, no angle cap, corrupts image
                 do_enhance=True,     # ✅ ENABLED — CLAHE contrast enhancement (safe, helps faded scans)
                 do_denoise=False,    # ❌ OFF — too slow, blurs text
-                do_sharpen=False,    # ❌ DISABLED — hard kernel halos batch code chars on JPEG artifacts
+                do_sharpen=True,     # ✅ ENABLED — helps clarify small text like item codes and batch numbers
                 do_crop_border=True, # ✅ ENABLED — removes scanner margins (with safe 2% max-crop guard)
                 do_binarize=False    # ❌ OFF — only for genuinely faded invoices
             )
@@ -438,6 +438,226 @@ def extract_invoice():
             log_step("✅ OCR corrections applied")
         except Exception as ocr_fix_error:
             log_step(f"⚠️  OCR correction error (non-fatal): {ocr_fix_error}")
+
+        # ═══════════════════════════════════════════════════════════
+        # ITEM CODE DEDUP GUARD
+        # ───────────────────────────────────────────────────────────
+        # Problem: extraction or recheck passes can assign the same
+        # item_code to multiple items (e.g. AL-02-2355 from
+        # BEVATAS 100MG/4ML bleeding into BEVATAS 300MG/12ML which
+        # has NO code in the invoice).
+        #
+        # Rule: a given non-empty item_code may appear on at most ONE
+        # item per invoice. The FIRST item that carries the code is
+        # assumed correct (it is the item the model extracted it from
+        # directly). Any subsequent item sharing the same code gets its
+        # item_code reset to "" (blank — the safe "not found" value).
+        # ═══════════════════════════════════════════════════════════
+        log_step("Checking for duplicate item codes across line items...")
+        print("[DEBUG] ════ ITEM CODE DEDUP STARTING ════")
+        try:
+            items_list = extracted_data.get('items', [])
+            seen_codes: set = set()
+            dedup_cleared = 0
+            for _item in items_list:
+                _code = str(_item.get('item_code') or '').strip()
+                if not _code:
+                    continue  # blank is always fine — many items share ""
+                if _code in seen_codes:
+                    _desc = str(_item.get('description') or '')[:50]
+                    log_step(f"   ⚠️  Duplicate item_code '{_code}' cleared from: {_desc!r}")
+                    _item['item_code'] = ''
+                    dedup_cleared += 1
+                else:
+                    seen_codes.add(_code)
+            if dedup_cleared:
+                log_step(f"⚠️  Item code dedup: cleared {dedup_cleared} duplicate(s)")
+            else:
+                log_step("✅ Item code dedup: all codes unique")
+        except Exception as _dedup_err:
+            log_step(f"⚠️  Item code dedup error (non-fatal): {_dedup_err}")
+
+        # ═══════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════
+        # MISSING ITEM CODE RECOVERY (Strict - Same Item Only)
+        # ───────────────────────────────────────────────────────────
+        # Problem: Model sees "Code : AL-XX-XXXX" on invoice but doesn't
+        # always extract it to item_code field (even with reasoning).
+        #
+        # Solution: For items with blank item_code, check if "Code : AL-XX-XXXX"
+        # appears in THAT SAME ITEM'S description field. Extract it.
+        #
+        # Rule: NEVER copy codes from other items. Only extract from the
+        # item's own description text.
+        # ═══════════════════════════════════════════════════════════
+        log_step("Checking for item codes in descriptions (strict mode)...")
+        print("[DEBUG] ════ ITEM CODE RECOVERY STARTING ════")
+        try:
+            import re
+            items_list = extracted_data.get('items', [])
+            print(f"[DEBUG] items_list type: {type(items_list)}, length: {len(items_list)}")
+            
+            # Pattern: "Code : AL-02-1234" or "Prod Code : AL-02-1234"
+            # Flexible: accepts hyphens, spaces, dots, or nothing between parts
+            code_pattern = re.compile(r'(?:Prod\s+)?Code\s*:\s*([A-Z]{2}[\s\-\.]?\d{2}[\s\-\.]?\d{4})', re.IGNORECASE)
+            
+            # DEBUG: Print all descriptions to see what model extracted
+            log_step(f"   DEBUG: Checking {len(items_list)} items for codes in descriptions")
+            print(f"[DEBUG] About to loop through {len(items_list)} items")
+            for idx, item in enumerate(items_list, 1):
+                desc = str(item.get('description') or '').strip()
+                code = str(item.get('item_code') or '').strip()
+                msg = f"   Item {idx}: code='{code}', desc='{desc[:80]}'"
+                log_step(msg)
+                print(f"[DEBUG] {msg}")
+            
+            print("[DEBUG] Finished printing items, now checking for missing codes...")
+            codes_filled = 0
+            for item in items_list:
+                # Skip if item already has a code
+                if str(item.get('item_code') or '').strip():
+                    continue
+                
+                # Check ONLY this item's description
+                desc = str(item.get('description') or '').strip()
+                code_match = code_pattern.search(desc)
+                
+                if code_match:
+                    found_code = code_match.group(1).upper()
+                    
+                    # Normalize: AL 02 1234 → AL-02-1234
+                    normalized_code = re.sub(r'[\s\.]', '', found_code)
+                    if len(normalized_code) >= 8:
+                        normalized_code = f"{normalized_code[:2]}-{normalized_code[2:4]}-{normalized_code[4:8]}"
+                    
+                    # Verify this code isn't already used by another item
+                    if normalized_code not in seen_codes:
+                        item['item_code'] = normalized_code
+                        seen_codes.add(normalized_code)
+                        codes_filled += 1
+                        log_step(f"   ✅ Found code in description: '{normalized_code}' for {desc[:40]}")
+                    else:
+                        # Code exists in description but already used by another item
+                        # This means model included another item's code in this description (error)
+                        # Keep item_code blank (correct behavior)
+                        log_step(f"   ⚠️  Code '{normalized_code}' in description already used, keeping blank for {desc[:40]}")
+            
+            if codes_filled:
+                log_step(f"✅ Item code recovery: extracted {codes_filled} code(s) from descriptions")
+                print(f"[DEBUG] Codes filled: {codes_filled}")
+            else:
+                log_step("ℹ️  Item code recovery: all items either have codes or no code in description")
+                print("[DEBUG] No codes filled")
+                
+        except Exception as _recovery_err:
+            log_step(f"⚠️  Item code recovery error (non-fatal): {_recovery_err}")
+            print(f"[DEBUG] EXCEPTION in recovery: {_recovery_err}")
+            import traceback
+            traceback.print_exc()
+
+        # ═══════════════════════════════════════════════════════════
+        # VISION-BASED ITEM CODE RECOVERY (For Missed Codes)
+        # ═══════════════════════════════════════════════════════════
+        # If items still have blank codes after description recovery,
+        # re-query the model with targeted instructions for each blank item.
+        # This handles cases where model completely misses "Code : AL-XX-XXXX"
+        # even when it's clearly visible on the invoice.
+        # ───────────────────────────────────────────────────────────
+        print("[DEBUG] ════ VISION RECOVERY CHECK STARTING ════")
+        try:
+            items_needing_codes = [
+                (idx, item) for idx, item in enumerate(extracted_data.get('items', []))
+                if not str(item.get('item_code') or '').strip()
+            ]
+            
+            print(f"[DEBUG] Items needing codes: {len(items_needing_codes)}")
+            
+            if items_needing_codes:
+                log_step(f"🔍 Vision recovery: {len(items_needing_codes)} item(s) still missing codes")
+                print(f"[DEBUG] ════ VISION RECOVERY STARTING for {len(items_needing_codes)} items ════")
+                
+                for idx, item in items_needing_codes:
+                    product_name = item.get('description', 'Unknown')
+                    batch = item.get('Batch', 'Unknown')
+                    
+                    # Create targeted prompt for this specific item
+                    vision_prompt = f"""Find the item code for this specific item on the invoice:
+Product: {product_name}
+Batch: {batch}
+
+INSTRUCTIONS:
+1. Locate the row with product "{product_name}" and batch "{batch}"
+2. Look for "Code :" or "Prod Code :" near this item
+3. Item codes follow pattern: XX-XX-XXXX (2 letters, hyphen, 2 digits, hyphen, 4 digits)
+4. Examples: AL-02-2841, AL-01-7146, XY-99-1234
+5. Return ONLY the code (e.g., "AL-02-2841")
+6. If no code visible for this specific item, return: NONE
+
+Respond with just the code or NONE, nothing else."""
+
+                    try:
+                        log_step(f"   Querying for: {product_name} (Batch {batch})")
+                        print(f"[DEBUG] Querying vision model for item {idx+1}: {product_name}")
+                        
+                        # Use query_model from client (takes single image, system_prompt, user_prompt)
+                        response = client.query_model(
+                            image=images[0],  # First page
+                            system_prompt="You are an AI that extracts item codes from invoices.",
+                            user_prompt=vision_prompt,
+                            temperature=0.0
+                        )
+                        
+                        found_code = response.strip().upper()
+                        print(f"[DEBUG] Vision response for item {idx+1}: '{found_code}'")
+                        
+                        # Normalize code: remove spaces/dots, ensure hyphens
+                        # AL 02 1234 → AL-02-1234
+                        # AL.02.1234 → AL-02-1234
+                        # AL021234 → AL-02-1234
+                        normalized_code = re.sub(r'[\s\.]', '', found_code)  # Remove spaces and dots
+                        if len(normalized_code) >= 8:  # At least XX021234
+                            # Insert hyphens: XX021234 → XX-02-1234
+                            normalized_code = f"{normalized_code[:2]}-{normalized_code[2:4]}-{normalized_code[4:8]}"
+                        
+                        print(f"[DEBUG] Normalized code: '{normalized_code}'")
+                        
+                        # Validate the normalized response
+                        import re
+                        code_pattern = re.compile(r'^[A-Z]{2}-\d{2}-\d{4}$')
+                        if code_pattern.match(normalized_code):
+                            # Check if this code is already used
+                            if normalized_code not in seen_codes:
+                                item['item_code'] = normalized_code
+                                seen_codes.add(normalized_code)
+                                log_step(f"   ✅ Vision recovery found: {normalized_code}")
+                                print(f"[DEBUG] Item {idx+1} code set to: {normalized_code}")
+                            else:
+                                log_step(f"   ⚠️  Code {normalized_code} already used, keeping blank")
+                                print(f"[DEBUG] Item {idx+1} code {normalized_code} is duplicate, skipping")
+                        elif found_code == 'NONE':
+                            log_step(f"   ℹ️  No code visible for this item (confirmed by vision)")
+                            print(f"[DEBUG] Item {idx+1} has no code on invoice")
+                        else:
+                            log_step(f"   ⚠️  Invalid response format: {found_code[:50]}")
+                            print(f"[DEBUG] Item {idx+1} got invalid response: {found_code[:80]}")
+                            
+                    except Exception as vision_err:
+                        log_step(f"   ⚠️  Vision query failed: {vision_err}")
+                        print(f"[DEBUG] Vision recovery exception for item {idx+1}: {vision_err}")
+                        import traceback
+                        traceback.print_exc()
+                        
+                log_step("✅ Vision-based recovery complete")
+            else:
+                print("[DEBUG] No items need vision recovery")
+                
+        except Exception as vision_recovery_err:
+            log_step(f"⚠️  Vision recovery check failed: {vision_recovery_err}")
+            print(f"[DEBUG] EXCEPTION in vision recovery check: {vision_recovery_err}")
+            import traceback
+            traceback.print_exc()
+
+
 
         # ═══════════════════════════════════════════════════════════
         # FIX: invoice_amount vs round_off reconciliation
@@ -638,7 +858,154 @@ def extract_invoice():
         log_step(f"✅ total_quantity = {extracted_data['total_quantity']} (paid only)")
         log_step(f"   Paid items total: {paid_quantity_sum}")
         log_step(f"   Free items total: {free_quantity_sum} (excluded)")
-        
+
+        # ═══════════════════════════════════════════════════════════
+        # INVOICE TOTALS RE-SUM GUARD
+        # ───────────────────────────────────────────────────────────
+        # Problem: the model sometimes reads the last item row's GST
+        # amounts instead of the invoice summary row, producing header
+        # totals that match a single item rather than the sum of all.
+        #
+        # Detection: sum item-level paid amounts from extracted items.
+        # If the header field (total_cgst_amount, total_sgst_amount,
+        # total_gst_amount, invoice_amount, taxable_amount) matches
+        # any SINGLE item's value (within 1%) instead of the computed
+        # sum, replace the header with the computed sum.
+        #
+        # We NEVER override when the header value is already close to
+        # the computed sum — only when it clearly matches just one item.
+        # ═══════════════════════════════════════════════════════════
+        log_step("Validating and correcting invoice-level totals vs item sums...")
+        try:
+            def _flt(v):
+                """Safe float conversion; returns None on failure."""
+                if v is None:
+                    return None
+                try:
+                    return float(str(v).replace(',', '').replace('₹', '').strip())
+                except (ValueError, TypeError):
+                    return None
+
+            def _close(a, b, tol=0.02):
+                """True if two floats are within relative tolerance (default 2%)."""
+                if a is None or b is None:
+                    return False
+                if b == 0:
+                    return abs(a) < 0.01
+                return abs(a - b) / abs(b) <= tol
+
+            paid_items = [it for it in extracted_data.get('items', [])
+                          if it.get('free_item_yn') != "1"]
+
+            # Compute sums from paid item-level fields
+            sum_cgst      = sum(_flt(it.get('cgst_amount'))  or 0 for it in paid_items)
+            sum_sgst      = sum(_flt(it.get('sgst_amount'))  or 0 for it in paid_items)
+            sum_igst      = sum(_flt(it.get('igst_amount'))  or 0 for it in paid_items)
+            sum_gst       = round(sum_cgst + sum_sgst + sum_igst, 2)
+            sum_taxable   = sum(_flt(it.get('taxable_value')) or 0 for it in paid_items)
+            sum_net       = round(sum_taxable + sum_gst, 2)
+
+            # Per-item values used for single-item mismatch detection
+            item_cgst_vals    = [_flt(it.get('cgst_amount'))  for it in paid_items]
+            item_sgst_vals    = [_flt(it.get('sgst_amount'))  for it in paid_items]
+            item_gst_vals     = [round((_flt(it.get('cgst_amount')) or 0)
+                                       + (_flt(it.get('sgst_amount')) or 0)
+                                       + (_flt(it.get('igst_amount')) or 0), 2)
+                                 for it in paid_items]
+            item_taxable_vals = [_flt(it.get('taxable_value')) for it in paid_items]
+            item_total_vals   = [_flt(it.get('total_price'))  for it in paid_items]
+
+            def _single_item_match(header_val, item_vals, computed_sum):
+                """
+                Returns True when header_val is close to one item's value
+                but NOT close to the computed sum.
+                Indicates the model copied a single row instead of the total.
+                """
+                if header_val is None or header_val == 0:
+                    return False
+                if _close(header_val, computed_sum):
+                    return False          # already correct — leave it
+                return any(_close(header_val, v) for v in item_vals if v)
+
+            corrections_applied = []
+
+            # ── total_cgst_amount ──────────────────────────────────
+            hdr_cgst = _flt(extracted_data.get('total_cgst_amount'))
+            if (sum_cgst > 0
+                    and not _close(hdr_cgst, sum_cgst)
+                    and _single_item_match(hdr_cgst, item_cgst_vals, sum_cgst)):
+                extracted_data['total_cgst_amount'] = round(sum_cgst, 2)
+                corrections_applied.append(
+                    f"total_cgst_amount: {hdr_cgst} → {round(sum_cgst,2)}")
+
+            # ── total_sgst_amount ──────────────────────────────────
+            hdr_sgst = _flt(extracted_data.get('total_sgst_amount'))
+            if (sum_sgst > 0
+                    and not _close(hdr_sgst, sum_sgst)
+                    and _single_item_match(hdr_sgst, item_sgst_vals, sum_sgst)):
+                extracted_data['total_sgst_amount'] = round(sum_sgst, 2)
+                corrections_applied.append(
+                    f"total_sgst_amount: {hdr_sgst} → {round(sum_sgst,2)}")
+
+            # ── total_igst_amount ──────────────────────────────────
+            hdr_igst = _flt(extracted_data.get('total_igst_amount'))
+            if (sum_igst > 0
+                    and not _close(hdr_igst, sum_igst)
+                    and _single_item_match(hdr_igst,
+                                           [_flt(it.get('igst_amount')) for it in paid_items],
+                                           sum_igst)):
+                extracted_data['total_igst_amount'] = round(sum_igst, 2)
+                corrections_applied.append(
+                    f"total_igst_amount: {hdr_igst} → {round(sum_igst,2)}")
+
+            # ── total_gst_amount ───────────────────────────────────
+            hdr_gst = _flt(extracted_data.get('total_gst_amount'))
+            if (sum_gst > 0
+                    and not _close(hdr_gst, sum_gst)
+                    and _single_item_match(hdr_gst, item_gst_vals, sum_gst)):
+                extracted_data['total_gst_amount'] = round(sum_gst, 2)
+                corrections_applied.append(
+                    f"total_gst_amount: {hdr_gst} → {round(sum_gst,2)}")
+
+            # ── taxable_amount (invoice header) ────────────────────
+            hdr_taxable = _flt(extracted_data.get('taxable_amount'))
+            if (sum_taxable > 0
+                    and not _close(hdr_taxable, sum_taxable)
+                    and _single_item_match(hdr_taxable, item_taxable_vals, sum_taxable)):
+                extracted_data['taxable_amount'] = round(sum_taxable, 2)
+                corrections_applied.append(
+                    f"taxable_amount: {hdr_taxable} → {round(sum_taxable,2)}")
+
+            # ── invoice_amount ─────────────────────────────────────
+            # Strategy:
+            # 1. If header value matches a single item → replace with sum (wrong extraction)
+            # 2. If header is null/0 but sum is valid → fill with sum (missing extraction)
+            hdr_inv = _flt(extracted_data.get('invoice_amount'))
+            if sum_net > 0 and sum_taxable > 0 and sum_gst > 0:
+                # Case 1: wrong extraction (model read one item row as total)
+                if (hdr_inv and hdr_inv > 0
+                        and not _close(hdr_inv, sum_net)
+                        and _single_item_match(hdr_inv, item_total_vals, sum_net)):
+                    extracted_data['invoice_amount'] = round(sum_net, 2)
+                    corrections_applied.append(
+                        f"invoice_amount: {hdr_inv} → {round(sum_net,2)}")
+                # Case 2: missing extraction (invoice_amount is null or 0)
+                elif not hdr_inv or hdr_inv == 0:
+                    extracted_data['invoice_amount'] = round(sum_net, 2)
+                    corrections_applied.append(
+                        f"invoice_amount: null/0 → {round(sum_net,2)} (computed from items)")
+
+            if corrections_applied:
+                for msg in corrections_applied:
+                    log_step(f"⚠️  Totals re-sum correction: {msg}")
+                log_step(f"⚠️  {len(corrections_applied)} header total(s) corrected "
+                         f"(model read single item row instead of summary)")
+            else:
+                log_step("✅ Invoice totals re-sum: header totals consistent with item sums")
+
+        except Exception as _resum_err:
+            log_step(f"⚠️  Totals re-sum error (non-fatal): {_resum_err}")
+
         # ═══════════════════════════════════════════════════════════
         # GST VALIDATION (Original)
         # ═══════════════════════════════════════════════════════════
@@ -1314,4 +1681,4 @@ if __name__ == '__main__':
     print("="*80)
     print(f"\n[INFO] Open http://localhost:{web_port} in your browser\n")
     
-    app.run(debug=True, host='0.0.0.0', port=web_port)
+    app.run(debug=True, host='0.0.0.0', port=web_port, threaded=True)

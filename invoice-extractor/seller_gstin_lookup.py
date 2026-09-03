@@ -129,9 +129,9 @@ SELLER_GSTIN_MAP: dict[str, str] = {
     "DEENANATH MEDICAL STORES":                 "27AAATL1944N1ZA",
 
     # ── Ravi Medico ──────────────────────────────────────────────────
-    "RAVI MEDICO":                              "27AAATL1944N1ZA",
+    "RAVI MEDICO":                              "27AAUPR1161Q1ZD",
 
-    # ── Galaxy Alliance LLP ──────────────────────────────────────────
+    # ── Galaxy Alliance LLP ────────────────────────────────────────── 
     "GALAXY ALLIANCE LLP":                      "27AAYFG6456C1ZY",
 
     # ── MIS Healthcare ───────────────────────────────────────────────
@@ -152,6 +152,9 @@ SELLER_GSTIN_MAP: dict[str, str] = {
     # ── KDB Surgi-Pharma ─────────────────────────────────────────────
     "KDB SURGI PHARMA":                         "27AAIFK8419R1ZG",
     "KDB SURGIPHARMA":                          "27AAIFK8419R1ZG",
+
+    # ── Chandulal R Mehta ────────────────────────────────────────────
+    "CHANDULAL R MEHTA":                        "27AAKPC8047A1ZB",
 }
 
 

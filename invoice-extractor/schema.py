@@ -288,6 +288,19 @@ SYSTEM_PROMPT = (
 
     '── RULE 10: EXPIRY DATE ────────────────────────────────────────────────\n'
     '⚠️⚠️⚠️ CRITICAL: Extract expiry dates EXACTLY as printed on the invoice.\n'
+    'EACH ITEM HAS ITS OWN EXPIRY DATE — DO NOT COPY THE SAME DATE TO ALL ITEMS!\n'
+    '\n'
+    'IMPORTANT: Different batches of the same product have DIFFERENT expiry dates.\n'
+    'Read the Expiry Date column for EACH ROW individually.\n'
+    '\n'
+    'Example:\n'
+    '  Row 1: ABSOLUT 3G CAPS, Batch AT5070114 → Expiry: 01/01/1970\n'
+    '  Row 2: SUPRACAL 2000+ TAB, Batch STPP26844 → Expiry: 01/01/1970\n'
+    '  Row 3: SUPRADYN DAILY TAB, Batch MH10394 → Expiry: 01/01/1970\n'
+    '\n'
+    '⚠️ DO NOT extract all items as having the same expiry date!\n'
+    'Read each row\'s expiry column separately.\n'
+    '\n'
     'DO NOT convert, calculate, or modify the date format.\n\n'
     'If invoice shows MM/YY format → extract MM/YY (e.g., "04/29" → extract "04/29")\n'
     'If invoice shows DD-MM-YY → extract DD-MM-YY (e.g., "28-02-28" → extract "28-02-28")\n'
@@ -1372,12 +1385,24 @@ USER_PROMPT = (
     '     → free_item_yn: "1"\n'
     '   The zero-quantity row (Row A) is NOT a standalone item — it only carries free qty.\n'
     '   NEVER output an item with quantity=0 from this two-row pattern.\n\n'
+    '⚠️ FREE ITEM FINANCIAL VALUES (CRITICAL — READ CAREFULLY):\n'
+    'When an invoice row is the FREE/DISC QTY row (quantity in QTY column is blank or 0,\n'
+    'or the row has DISC QTY filled but QTY blank), the financial columns often show:\n'
+    '  Rate=0.00, Amount=0.00, Taxable=0.00, CGST=0.00, SGST=0.00\n'
+    'This means the seller is giving those units at NO CHARGE.\n\n'
+    '⚠️ MANDATORY RULE FOR FREE ROW FINANCIALS:\n'
+    '• Copy financial values EXACTLY as printed in the invoice row.\n'
+    '• If the free row shows Amount=0.00 → unit_price=0, total_price=0, taxable_value=0\n'
+    '• Do NOT copy the Rate/Amount from an adjacent paid row.\n'
+    '• Do NOT calculate unit_price × free_qty and put it in total_price.\n'
+    '• The invoice Amount column is the authority — copy it verbatim.\n\n'
     'EXAMPLES:\n'
     '• Qty=20, FREE=2 → quantity: 20, free_quantity: 2, free_item_yn: "1"\n'
     '• Qty=50, FREE=5 → quantity: 50, free_quantity: 5, free_item_yn: "1"\n'
     '• Qty: "20+2" → quantity: "20+2", free_item_yn: "1"\n'
     '• Qty=100, FREE=(empty) → quantity: 100, free_quantity: null, free_item_yn: "0"\n'
-    '• Two rows (QTY=0,DISC=10)+(QTY=100) → ONE item: quantity:100, free_quantity:10, free_item_yn:"1"\n\n'
+    '• Two rows (QTY=0,DISC=10)+(QTY=100) → ONE item: quantity:100, free_quantity:10, free_item_yn:"1"\n'
+    '• Free row shows DISC QTY=15, Rate=0, Amount=0 → unit_price:0, total_price:0, taxable_value:0\n\n'
     '⚠️ CRITICAL: total_quantity = Sum of PAID quantities ONLY\n'
     '• FREE/BONUS/SCHEME quantities are NEVER included in total_quantity\n'
     '• Example: Items are 20+2, 10, 5+1 → total_quantity = 20 + 10 + 5 = 35 (NOT 38)\n\n'
@@ -1889,6 +1914,19 @@ def get_items_prompt() -> tuple[str, str]:
         "  'Dicorate ER 250'  + next line 'Prod Code : AL-01-3611.' → item_code = 'AL-01-3611'\n"
         "  'Opiprol 50'       + NO next-line code                   → item_code = ''\n"
         "  \n"
+        "  🚨🚨🚨 DUPLICATE PRODUCT NAMES (CRITICAL - READ CAREFULLY):\n"
+        "  When the SAME product name appears MULTIPLE times with DIFFERENT batches,\n"
+        "  EACH occurrence has ITS OWN next-line code. Extract ALL of them!\n"
+        "  \n"
+        "  REAL EXAMPLE:\n"
+        "    Row 2: UJVIRA 100MG, Batch GB0457A → Next line: Code : AL-02-2841 → item_code='AL-02-2841' ✓\n"
+        "    Row 3: UJVIRA 100MG, Batch GB0855A → Next line: Code : AL-02-2841 → item_code='AL-02-2841' ✓ (NOT blank!)\n"
+        "    Row 6: VIVITRA 375MG, Batch VB00046A → Next line: Code : AL-02-3111 → item_code='AL-02-3111' ✓\n"
+        "    Row 7: VIVITRA 375MG, Batch BA00007A → Next line: Code : AL-02-3111 → item_code='AL-02-3111' ✓ (NOT blank!)\n"
+        "  \n"
+        "  ⚠️ DO NOT skip code extraction just because you saw this product name before!\n"
+        "  Different batch = different item = has its own code on the next line!\n"
+        "  \n"
         "  🚫 NEVER assign AL-01-6603 to Opiprol or Sizopin just because it exists!\n"
         "- ⚠️⚠️⚠️ DMH/RACK/PCode COLUMN → item_code FIELD:\n"
         "  Column value goes to item_code field (NOT reference_number)\n"
@@ -1898,8 +1936,11 @@ def get_items_prompt() -> tuple[str, str]:
         "  • Default: free_item_yn = '0' for every item\n"
         "  • If ANY free quantity exists → free_item_yn = '1'\n"
         "  • '20+2' in QTY column → quantity: '20+2' (string), free_item_yn: '1'\n"
+        "  • '5+1' or 'S+1' in QTY column → quantity: '5+1' (string), free_item_yn: '1'\n"
         "  • Separate FREE/BONUS/SCH/DISC QTY column with a value:\n"
         "    → quantity: <paid qty number>, free_quantity: <free qty number>, free_item_yn: '1'\n"
+        "  • Pattern 'S + 1 FREE' or '5 + 1 FREE' (S means 5 in pharmacy shorthand):\n"
+        "    → quantity: 5, free_quantity: 1, free_item_yn: '1'\n"
         "  • Separate FREE column is blank/zero → free_quantity: null, free_item_yn: '0'\n"
         "  ⚠️ TWO-ROW FREE ITEM FORMAT (VERY IMPORTANT):\n"
         "  Some invoices show free items as TWO separate rows for the same product:\n"
@@ -1917,6 +1958,14 @@ def get_items_prompt() -> tuple[str, str]:
         "    Qty=100, FREE=  → quantity:100, free_quantity:null, free_item_yn:'0'\n"
         "    Qty='20+2'      → quantity:'20+2', free_item_yn:'1'\n"
         "    Two rows: QTY=0+DISC=10, then QTY=100 → ONE item: quantity:100, free_quantity:10, free_item_yn:'1'\n"
+        "  ⚠️ FREE ROW FINANCIAL VALUES — COPY EXACTLY FROM INVOICE:\n"
+        "  When a row is the free/DISC QTY row and the invoice shows Rate=0, Amount=0:\n"
+        "    → unit_price: 0, total_price: 0, Value: 0, taxable_value: 0\n"
+        "    → cgst_amount: 0, sgst_amount: 0, GST_AMT: 0\n"
+        "  Copy these zeros VERBATIM. Do NOT copy rate/amount from the adjacent paid row.\n"
+        "  Do NOT calculate unit_price × free_qty — that would fabricate values not on the invoice.\n"
+        "  Real example (this invoice): DISC QTY row shows Rate=0.00, Amount=0.00\n"
+        "    → unit_price: 0, total_price: 0, taxable_value: 0  (NOT 2600, NOT 39000)\n"
         "- Copy Batch exactly as shown (replace <>$#@&| with -, preserve /)\n"
         "- Rates are PERCENTAGES, amounts are MONETARY VALUES\n"
         "- DISCOUNT EXTRACTION (CRITICAL):\n"

@@ -708,6 +708,64 @@ class OpenRouterClient:
             print(f"❌ {error_msg}")
             return {'error': error_msg}, {}
     
+    def query_model(
+        self,
+        image: Image.Image,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.0
+    ) -> str:
+        """
+        Simple query method for targeted extraction tasks (e.g., missing item codes).
+        Returns the raw text response from the model.
+        """
+        headers = {
+            'Authorization': f'Bearer {self.api_key}',
+            'Content-Type': 'application/json',
+            'HTTP-Referer': 'https://github.com/yourusername/invoice-extractor',
+            'X-Title': 'Invoice Extractor'
+        }
+        
+        # Convert image to base64
+        image_b64 = self.image_to_base64(image, format='JPEG', max_size=4096, model_name=self.FAST_MODEL)
+        
+        # Build simple payload (use fast model for speed)
+        payload = {
+            'model': self.FAST_MODEL,
+            'messages': [
+                {
+                    'role': 'user',
+                    'content': [
+                        {'type': 'text', 'text': (system_prompt + '\n\n' + user_prompt).strip()},
+                        {'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{image_b64}'}}
+                    ]
+                }
+            ],
+            'temperature': temperature,
+            'max_tokens': 500,
+            'reasoning': {'effort': 'none', 'exclude': True},
+            'reasoning_effort': 'none'
+        }
+        
+        try:
+            response = requests.post(
+                self.base_url,
+                headers=headers,
+                json=payload,
+                timeout=60
+            )
+            
+            if response.status_code != 200:
+                raise Exception(f"API Error ({response.status_code}): {response.text}")
+            
+            response_data = response.json()
+            content = response_data['choices'][0]['message']['content'].strip()
+            return content
+            
+        except Exception as e:
+            print(f"⚠️  query_model failed: {e}")
+            raise
+    
     def get_reasoning_stream(self) -> str:
         """
         Generate a mock reasoning stream for the UI.
@@ -808,8 +866,8 @@ class OpenRouterClient:
             items_user_with_context,
             temperature=temperature,
             max_tokens=16000,  # Items pass: each item ~150-200 tokens; 16000 covers 60+ items
-                              # reasoning excluded via exclude=True — full budget for JSON output
-            use_reasoning=True  # ✅ CRITICAL: Items pass needs character-level accuracy for batch codes (W/V, M/N, etc.)
+            # Reasoning can be disabled via env var for faster extraction (trades accuracy for speed)
+            use_reasoning=os.getenv('USE_REASONING_FOR_ITEMS', 'true').lower() == 'true'
         )
         
         if 'error' in items_data:
@@ -1497,9 +1555,15 @@ class OpenRouterClient:
 
             return False
 
-        # Fields that can legitimately be split across a page boundary
+        # Fields that can legitimately be split across a page boundary.
+        # NOTE: item_code is intentionally EXCLUDED. Continuation rows (page-break
+        # fragments with batch/expiry but no description/quantity) should never
+        # propagate an item_code to the prior item — the code must come from the
+        # item's own row in the invoice. Including item_code here caused codes from
+        # one product (e.g. BEVATAS 100MG/4ML → AL-02-2355) to bleed into the
+        # adjacent product (BEVATAS 300MG/12ML) that had no code of its own.
         _CONTINUATION_FIELDS = (
-            'Batch', 'expiry_date', 'item_code',
+            'Batch', 'expiry_date',
             'hsn_sac', 'Pack', 'MRP',
         )
 
@@ -1534,13 +1598,20 @@ class OpenRouterClient:
         #
         # This covers the edge case: model returns page-2 metadata as a
         # separate item with description="" or description copied from prior.
+        #
+        # NOTE: item_code is intentionally NOT patched across items here.
+        # _CONTINUATION_FIELDS already excludes item_code (see STEP 1a).
+        # A page-boundary continuation row rarely carries only an item_code,
+        # and blindly copying one would give the wrong product a code it
+        # doesn't have in the invoice (the root cause of the BEVATAS bug).
+        # If the orphan row being absorbed happens to carry an item_code,
+        # we log it for traceability but do NOT copy it.
         # ════════════════════════════════════════════════════════════
         def _item_missing_meta(item: dict) -> bool:
-            """True if item lacks batch AND expiry AND item_code."""
+            """True if item lacks batch AND expiry (item_code alone is not sufficient)."""
             no_batch  = not str(item.get('Batch') or '').strip()
             no_expiry = not str(item.get('expiry_date') or '').strip()
-            no_code   = not str(item.get('item_code') or '').strip()
-            return no_batch and no_expiry and no_code
+            return no_batch and no_expiry
 
         def _item_is_meta_only(item: dict) -> bool:
             """True if item has no meaningful description but has batch/expiry."""
@@ -1558,11 +1629,18 @@ class OpenRouterClient:
             if (i not in patched_indices
                     and _item_missing_meta(item)
                     and _item_is_meta_only(next_item)):
-                # Patch metadata from next item into this one
+                # Patch batch/expiry/hsn/pack/mrp from orphan row — NOT item_code.
+                # _CONTINUATION_FIELDS excludes item_code by design.
                 for field in _CONTINUATION_FIELDS:
                     val = next_item.get(field)
                     if val is not None and str(val).strip() and not item.get(field):
                         item[field] = val
+                # Log if the absorbed orphan carried a code we are intentionally dropping
+                orphan_code = str(next_item.get('item_code') or '').strip()
+                if orphan_code:
+                    print(f"   Forward-look: orphan row had item_code={orphan_code!r} "
+                          f"— NOT copied to '{item.get('description', '')[:40]}' "
+                          f"(code must come from direct extraction only)")
                 patched_indices.add(i + 1)   # mark next item for removal
                 desc_preview = item.get('description', '')[:40]
                 print(f"   Forward-look patch: '{desc_preview}' "
@@ -1995,6 +2073,12 @@ class OpenRouterClient:
 
         # ── Apply final results to items ──────────────────────────────────────
         corrections = 0
+
+        def _desc_words(d: str) -> set:
+            """Return a set of uppercase alpha-only words ≥3 chars from a description."""
+            import re as _re
+            return {w for w in _re.split(r'\W+', d.upper()) if len(w) >= 3}
+
         for i, item in enumerate(items):
             fr = flash_results[i] if i < len(flash_results) else {}
             pc = plus_corrections.get(i)
@@ -2013,9 +2097,31 @@ class OpenRouterClient:
             if final_batch and final_batch != prior_batch:
                 item['Batch'] = final_batch
                 changed.append(f"Batch {prior_batch!r}->{final_batch!r}")
+
+            # ── Item-code guard: only apply recheck code when the recheck
+            # description is consistent with this item's known description.
+            # This prevents a row-index shift in the recheck model from
+            # stamping item i's code onto item i±1 (e.g. AL-02-2355 from
+            # BEVATAS 100MG/4ML bleeding into BEVATAS 300MG/12ML).
             if final_code is not None and final_code != prior_code:
-                item['item_code'] = final_code
-                changed.append(f"code {prior_code!r}->{final_code!r}")
+                # Allow the update only when:
+                #   a) recheck returned no description (pure batch recheck, no layout confusion), OR
+                #   b) prior item has no description (ghost/placeholder row), OR
+                #   c) recheck description shares ≥1 meaningful word with the prior description
+                #      (i.e. the recheck model is clearly talking about the same product)
+                desc_match = (
+                    not final_desc          # recheck gave no description — safe
+                    or not prior_desc       # prior has no desc yet — safe
+                    or bool(_desc_words(final_desc) & _desc_words(prior_desc))  # overlap
+                )
+                if desc_match:
+                    item['item_code'] = final_code
+                    changed.append(f"code {prior_code!r}->{final_code!r}")
+                else:
+                    print(f"   Item {i+1} code SKIPPED — desc mismatch: "
+                          f"recheck={final_desc!r:.40} vs prior={prior_desc!r:.40} "
+                          f"(would have set code {prior_code!r}->{final_code!r})")
+
             if final_desc and final_desc != prior_desc:
                 item['description'] = final_desc
                 changed.append(f"desc corrected")

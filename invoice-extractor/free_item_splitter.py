@@ -149,11 +149,47 @@ def split_free_items(data: Dict[str, Any]) -> Dict[str, Any]:
             free_item = create_proportional_item(item, free_qty, is_free=True)
             new_items.append(free_item)
         
-        # Case 3: No free items
+        # Case 3: No free items — OR already a standalone free item row
+        # (free_item_yn="1" set by model, but no free_quantity to split)
         else:
-            item['free_item_yn'] = "0"
-            item.pop('free_quantity', None)
-            new_items.append(item)
+            # If the model already flagged this item as free (free_item_yn="1")
+            # with its own non-zero quantity, it is a standalone free item row
+            # extracted directly from the invoice (e.g. a DISC QTY column row).
+            # In that case keep the free flag and preserve invoice financials.
+            #
+            # Special case: model may have hallucinated a non-zero unit_price
+            # while the invoice clearly shows Amount=0 and Taxable=0.
+            # When total_price=0 AND taxable_value=0 (or both missing), zero out
+            # all monetary fields and unit_price to match the invoice.
+            if item.get('free_item_yn') == "1":
+                tp_v  = None
+                tv_v  = None
+                try:
+                    tp_v = float(str(item.get('total_price') or '0').replace(',', ''))
+                except (ValueError, TypeError):
+                    tp_v = None
+                try:
+                    tv_v = float(str(item.get('taxable_value') or '0').replace(',', ''))
+                except (ValueError, TypeError):
+                    tv_v = None
+
+                if (tp_v is None or tp_v == 0.0) and (tv_v is None or tv_v == 0.0):
+                    # Invoice shows explicit zeros — preserve them, zero out any
+                    # hallucinated unit_price so downstream enrichment stays clean
+                    zero_fields = ['total_price', 'Value', 'taxable_value',
+                                   'cgst_amount', 'sgst_amount', 'igst_amount', 'GST_AMT']
+                    for zf in zero_fields:
+                        item[zf] = 0.0
+                    item['unit_price'] = 0.0
+                    print(f"[FREE SPLIT] Zero-price standalone free item: "
+                          f"'{item.get('description','')[:40]}' qty={item.get('quantity')} "
+                          f"— all monetary fields set to 0.00")
+                item.pop('free_quantity', None)
+                new_items.append(item)
+            else:
+                item['free_item_yn'] = "0"
+                item.pop('free_quantity', None)
+                new_items.append(item)
     
     data['items'] = new_items
     return data
@@ -162,38 +198,88 @@ def split_free_items(data: Dict[str, Any]) -> Dict[str, Any]:
 def create_proportional_item(base_item: Dict[str, Any], new_qty: float, is_free: bool) -> Dict[str, Any]:
     """
     Create a proportional item record (paid or free) based on the new quantity.
-    
+
     CRITICAL: Invoice monetary values correspond to PAID quantity only, not paid+free.
-    
+
     UNCHANGED FIELDS (product-identifying):
     - description, Pack, Batch, hsn_sac, item_code
     - expiry_date, reference_number, Gst%, MRP, unit_price
     - cgst_rate, sgst_rate, igst_rate (rates remain the same)
     - Discount (percentage remains the same)
-    
+
     RECALCULATED FIELDS (quantity-dependent):
     - quantity → new_qty
     - total_price → unit_price × new_qty (always recalculated from unit_price)
     - Value, taxable_value, GST_AMT, cgst_amount, sgst_amount, igst_amount
       → proportional to new_qty / paid_qty (not total_qty!)
-    
+
+    ZERO-PRICE FREE ITEMS:
+    - Some invoices explicitly show 0.00 for Rate, Amount, and Taxable on the free row.
+      This means the seller has gifted those units at no value — all monetary fields
+      must remain 0.00 and unit_price must be set to 0 for the free record.
+    - Detection: the base item has total_price == 0 AND taxable_value == 0
+      (or both are null/missing). In that case ALL monetary fields → 0 and
+      unit_price → 0.  We do NOT calculate unit_price × free_qty.
+
     Args:
         base_item: Original item dict
         new_qty: New quantity (paid or free)
         is_free: True if this is a free item, False if paid
-    
+
     Returns:
         New item dict with proportional calculations
     """
     new_item = copy.deepcopy(base_item)
-    
+
+    # ── Helper ────────────────────────────────────────────────────────────────
+    def _to_float(v) -> float | None:
+        if v is None:
+            return None
+        try:
+            return float(str(v).replace(',', '').replace('₹', '').strip())
+        except (ValueError, TypeError):
+            return None
+
+    # ── Zero-price free item detection ───────────────────────────────────────
+    # When the invoice explicitly shows 0 amounts for this row (e.g. Rate=0,
+    # Amount=0, Taxable=0), we must preserve those zeros — do NOT compute
+    # unit_price × free_qty, as unit_price may have been copied from the paid
+    # row by the model even though the invoice printed 0.
+    #
+    # Condition: BOTH total_price and taxable_value are zero (or absent).
+    # A row where only one of them is zero could be a data gap, but if both
+    # are zero the invoice is unambiguous — the free units have no monetary value.
+    tp_val  = _to_float(base_item.get('total_price'))
+    tv_val  = _to_float(base_item.get('taxable_value'))
+    val_val = _to_float(base_item.get('Value'))
+
+    is_zero_price = (
+        (tp_val is None or tp_val == 0.0)
+        and (tv_val is None or tv_val == 0.0)
+    )
+
+    if is_free and is_zero_price:
+        # Invoice explicitly priced free units at zero — preserve that
+        zero_monetary = ['total_price', 'Value', 'taxable_value',
+                         'cgst_amount', 'sgst_amount', 'igst_amount', 'GST_AMT']
+        for field in zero_monetary:
+            new_item[field] = 0.0
+        new_item['unit_price']   = 0.0
+        new_item['quantity']     = new_qty
+        new_item['free_item_yn'] = "1"
+        new_item.pop('free_quantity', None)
+        print(f"[FREE SPLIT] Zero-price free item: '{base_item.get('description','')[:40]}' "
+              f"qty={new_qty} — all monetary fields set to 0.00")
+        return new_item
+
+    # ── Standard proportional split ───────────────────────────────────────────
     # Get original quantity and determine paid quantity
     original_qty = base_item.get('quantity')
     free_qty_field = base_item.get('free_quantity')
-    
+
     # Calculate PAID quantity (the denominator for proportional calculations)
     paid_qty = None
-    
+
     if isinstance(original_qty, str) and '+' in original_qty:
         # Parse "20+2" → paid_qty = 20
         parts = original_qty.split('+')
@@ -204,22 +290,22 @@ def create_proportional_item(base_item: Dict[str, Any], new_qty: float, is_free:
     else:
         # No free items, use quantity as-is
         paid_qty = float(original_qty) if original_qty else 1
-    
+
     # Calculate proportion based on PAID quantity (not total!)
     # This is the KEY fix: invoice values correspond to paid quantity
     proportion = new_qty / paid_qty if paid_qty > 0 else 0
-    
+
     # Set new quantity and flag
     new_item['quantity'] = new_qty
     new_item['free_item_yn'] = "1" if is_free else "0"
     new_item.pop('free_quantity', None)  # Remove free_quantity field
-    
+
     # Recalculate total_price from unit_price × quantity
     # Do NOT use proportional calculation for total_price
     if 'unit_price' in new_item and new_item['unit_price'] is not None:
         unit_price = float(new_item['unit_price']) if isinstance(new_item['unit_price'], str) else new_item['unit_price']
         new_item['total_price'] = round(unit_price * new_qty, 2)
-    
+
     # Recalculate quantity-dependent monetary fields proportionally
     # These are proportional to paid quantity, not total quantity
     monetary_fields = [
@@ -230,12 +316,12 @@ def create_proportional_item(base_item: Dict[str, Any], new_qty: float, is_free:
         'igst_amount',
         'GST_AMT'
     ]
-    
+
     for field in monetary_fields:
         if field in new_item and new_item[field] is not None:
             original_value = float(new_item[field]) if isinstance(new_item[field], str) else new_item[field]
             new_item[field] = round(original_value * proportion, 2)
-    
+
     # UNCHANGED FIELDS - keep exactly as they are:
     # - description, Pack, Batch, hsn_sac, item_code
     # - expiry_date, reference_number
@@ -243,7 +329,7 @@ def create_proportional_item(base_item: Dict[str, Any], new_qty: float, is_free:
     # - MRP (per-unit price doesn't change)
     # - unit_price (per-unit price doesn't change)
     # - Discount (percentage doesn't change)
-    
+
     return new_item
 
 

@@ -121,6 +121,8 @@ _DATE_FORMATS_IN = [
     '%Y-%m-%d',   # 2025-02-28 (ISO)
     '%m/%Y',      # 02/2025  → last day of month (pharma expiry)
     '%m/%y',      # 02/25    → last day of month (pharma expiry)
+    '%m-%y',      # 10-27    → last day of month (pharma expiry, VERY common)
+    '%m-%Y',      # 10-2027  → last day of month (pharma expiry)
     '%b-%y',      # Feb-28   → last day of month (pharma expiry, very common)
     '%b-%Y',      # Feb-2028 → last day of month
     '%b/%y',      # Feb/28   → last day of month
@@ -128,7 +130,7 @@ _DATE_FORMATS_IN = [
 ]
 
 # Formats where no day is given — use last day of month (pharma expiry convention)
-_MONTH_ONLY_FORMATS = {'%m/%Y', '%m/%y', '%b-%y', '%b-%Y', '%b/%y', '%b/%Y'}
+_MONTH_ONLY_FORMATS = {'%m/%Y', '%m/%y', '%m-%y', '%m-%Y', '%b-%y', '%b-%Y', '%b/%y', '%b/%Y'}
 
 _DATE_FORMAT_OUT = '%d/%m/%Y'
 
@@ -153,6 +155,15 @@ def correct_date(value: Any) -> Optional[str]:
         return value
 
     date_str = str(value).strip()
+    
+    # ── CLEANUP: Remove invoice numbers from date strings ────────────────
+    # Pattern: "CC-6566 26/09/2002" → "26/09/2002"
+    # Pattern: "INV-123 28-Feb-25" → "28-Feb-25"
+    # Look for: alphanumeric prefix + space/hyphen + actual date
+    cleaned = re.sub(r'^[A-Z0-9\-]+\s+', '', date_str, flags=re.IGNORECASE)
+    if cleaned != date_str:
+        print(f"[OCR-FIX] Date cleaned (invoice # removed): '{date_str}' → '{cleaned}'")
+        date_str = cleaned
 
     # Try standard formats first
     for fmt in _DATE_FORMATS_IN:
@@ -185,7 +196,7 @@ def correct_date(value: Any) -> Optional[str]:
             except ValueError:
                 pass
 
-    # Nothing worked — return as-is, don't silently drop the value
+    # Return as-is, don't silently drop the value
     print(f"[OCR-FIX] Date unparseable, kept as-is: '{date_str}'")
     return date_str
 
@@ -628,6 +639,88 @@ def apply_ocr_corrections(data: dict) -> dict:
                           f"[{item.get('description','')[:35]}]")
         except Exception:
             pass
+
+        # ── Pack field OCR correction ─────────────────────────────────────────
+        # The Pack field (e.g. VIAL, AMPOULE, TAB, CAP) is a small, constrained
+        # vocabulary. OCR errors like VIAL→VALL, AMPOULE→AMULE, CAP→COP are
+        # common because short uppercase strings get distorted in compressed images.
+        #
+        # Strategy: compare the extracted value (normalised) against a known pharma
+        # Pack vocabulary. If the extracted value is within 1 character edit-distance
+        # of a known term (and the extracted value is not itself a known term),
+        # correct it — unless the edit creates ambiguity (two candidates equally close).
+        #
+        # This is purely deterministic; no API call needed.
+        # ─────────────────────────────────────────────────────────────────────
+        _PACK_VOCAB = {
+            # Unit forms
+            'VIAL', 'AMPOULE', 'AMP', 'AMPULE',
+            'TAB', 'TABLET', 'TABLETS',
+            'CAP', 'CAPSULE', 'CAPSULES',
+            'BOTTLE', 'BOT',
+            'BOX', 'PKT', 'PACKET', 'PACK',
+            'TUBE', 'SACHET', 'STRIP',
+            'INJ', 'INJECTION',
+            'SYRINGE', 'SYR',
+            'CREAM', 'GEL', 'OINT', 'OINTMENT', 'LOTION', 'DROPS',
+            'SUSP', 'SUSPENSION', 'SYRUP', 'SYP',
+            'NOS', 'PCS', 'UNIT', 'UNITS',
+            'ML', 'MG',
+        }
+
+        def _pack_edit_distance(a: str, b: str) -> int:
+            """Levenshtein distance — pure Python, O(len(a)×len(b))."""
+            if a == b:
+                return 0
+            la, lb = len(a), len(b)
+            if la == 0: return lb
+            if lb == 0: return la
+            prev = list(range(lb + 1))
+            for i, ca in enumerate(a):
+                curr = [i + 1] + [0] * lb
+                for j, cb in enumerate(b):
+                    ins  = curr[j] + 1
+                    dele = prev[j + 1] + 1
+                    sub  = prev[j] + (0 if ca == cb else 1)
+                    curr[j + 1] = min(ins, dele, sub)
+                prev = curr
+            return prev[lb]
+
+        raw_pack = item.get('Pack')
+        if raw_pack and isinstance(raw_pack, str):
+            # Separate leading number from unit token, e.g. "10 VIAL" → "10", "VIAL"
+            # or "10VIAL" → "10", "VIAL"
+            m_pack = _re.match(r'^(\d+\.?\d*)\s*([A-Za-z]+.*)$', raw_pack.strip())
+            if m_pack:
+                num_part  = m_pack.group(1)
+                unit_part = m_pack.group(2).strip().upper()
+            else:
+                num_part  = ''
+                unit_part = raw_pack.strip().upper()
+
+            # Only attempt correction for purely alphabetic tokens (no digits mixed in)
+            if unit_part and unit_part.isalpha():
+                if unit_part not in _PACK_VOCAB:
+                    # Allowed edit distance scales with token length:
+                    #   ≤4 chars → allow up to 2 edits (short words compress badly)
+                    #   5+ chars → allow only 1 edit
+                    # Example: VIAL(4) → VALL(4) = 2 edits → corrected
+                    #           TABLET(6) → TEBLET(6) = 1 edit → corrected
+                    max_dist = 2 if len(unit_part) <= 4 else 1
+                    candidates = [v for v in _PACK_VOCAB
+                                  if _pack_edit_distance(unit_part, v) <= max_dist]
+                    if len(candidates) == 1:
+                        corrected_unit = candidates[0]
+                        corrected_pack = (f"{num_part} {corrected_unit}".strip()
+                                          if num_part else corrected_unit)
+                        print(f"[OCR-FIX] Pack '{raw_pack}' -> '{corrected_pack}' "
+                              f"(edit-dist-{max_dist} correction)")
+                        item['Pack'] = corrected_pack
+                        corrections_made += 1
+                    elif len(candidates) > 1:
+                        # Ambiguous — keep original, just log it
+                        print(f"[OCR-FIX] Pack '{raw_pack}': ambiguous candidates "
+                              f"{candidates} — kept as-is")
 
         # Item code — normalize slashes to hyphens, strip surrounding dots/spaces
         original_code = item.get('item_code')
