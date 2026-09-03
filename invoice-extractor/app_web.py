@@ -322,7 +322,7 @@ def extract_invoice():
             
             processed_image, preprocess_debug = preprocessor.process(
                 image,
-                do_orient=False,     # ❌ DISABLED — heuristic-only (OCR removed), rotates correct images wrongly
+                do_orient=True,      # ✅ ENABLED — Fix rotated invoices (this one is 90° rotated!)
                 do_deskew=False,     # ❌ DISABLED — Hough picks table lines, no angle cap, corrupts image
                 do_enhance=True,     # ✅ ENABLED — CLAHE contrast enhancement (safe, helps faded scans)
                 do_denoise=False,    # ❌ OFF — too slow, blurs text

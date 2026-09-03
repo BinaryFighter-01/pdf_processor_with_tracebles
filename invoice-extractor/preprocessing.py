@@ -96,21 +96,54 @@ class OrientationDetector:
             gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
             _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
             
-            # Simple heuristic: check aspect ratio and ink density
-            # Invoices are typically landscape (wider than tall)
-            if h > w * 1.3:  # Portrait but should be landscape
-                # Check top vs bottom density to distinguish 90° from 270°
+            # Advanced heuristic: check text orientation regardless of image aspect ratio
+            # Text typically flows horizontally. If most edges are vertical → text is sideways
+            edges = cv2.Canny(gray, 50, 150)
+            
+            # Count horizontal vs vertical edges
+            horizontal_kernel = np.ones((1, 5), np.uint8)
+            vertical_kernel = np.ones((5, 1), np.uint8)
+            
+            horizontal_edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, horizontal_kernel)
+            vertical_edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, vertical_kernel)
+            
+            h_count = np.sum(horizontal_edges > 0)
+            v_count = np.sum(vertical_edges > 0)
+            
+            # If vertical edges dominate (ratio > 1.5), text is likely sideways
+            if v_count > h_count * 1.5:
+                # Text is vertical → need 90° or 270° rotation
+                # Check top vs bottom ink density to decide direction
                 top_density = np.mean(binary[:h//4, :])
                 bottom_density = np.mean(binary[3*h//4:, :])
                 
-                # Header typically has more ink (logo, title)
-                if top_density > bottom_density * 1.1:
-                    rotation_angle = 270  # Rotate 90° counter-clockwise
+                # After 90° CW rotation, top should have more ink (header)
+                # Try both and pick the one with higher top ink
+                test_90 = self._rotate_exact(binary, 90)
+                test_270 = self._rotate_exact(binary, 270)
+                
+                top_90 = np.mean(test_90[:test_90.shape[0]//4, :])
+                top_270 = np.mean(test_270[:test_270.shape[0]//4, :])
+                
+                if top_90 > top_270:
+                    rotation_angle = 90
                 else:
-                    rotation_angle = 90   # Rotate 90° clockwise
+                    rotation_angle = 270
+                confidence = 0.75
+                method = 'text_orientation_heuristic'
+            elif h > w * 1.3:  
+                # Portrait image - likely needs rotation
+                top_density = np.mean(binary[:h//4, :])
+                bottom_density = np.mean(binary[3*h//4:, :])
+                
+                if top_density > bottom_density * 1.1:
+                    rotation_angle = 270
+                else:
+                    rotation_angle = 90
                 confidence = 0.7
+                method = 'aspect_ratio_heuristic'
             else:
-                # Already landscape-ish, check if upside down
+                # Landscape - check if upside down
                 top_density = np.mean(binary[:h//4, :])
                 bottom_density = np.mean(binary[3*h//4:, :])
                 
@@ -120,8 +153,7 @@ class OrientationDetector:
                 else:
                     rotation_angle = 0
                     confidence = 0.8
-            
-            method = 'aspect_ratio_heuristic'
+                method = 'aspect_ratio_heuristic'
         
         # Apply rotation
         img_np = np.array(pil_img.convert('RGB'))
